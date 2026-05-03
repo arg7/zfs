@@ -16,6 +16,7 @@
 
 /*
  * Copyright (c) 2020 by Delphix. All rights reserved.
+ * Copyright (c) 2026 CompEd Software Design srl.
  */
 
 #ifndef	_ZSTREAM_H
@@ -31,6 +32,7 @@ extern int zstream_do_decompress(int argc, char *argv[]);
 extern int zstream_do_drop_record(int argc, char *argv[]);
 extern int zstream_do_recompress(int argc, char *argv[]);
 extern int zstream_do_token(int, char *[]);
+extern int zstream_do_resume(int, char *[]);
 extern void zstream_usage(void);
 
 #ifdef	__cplusplus

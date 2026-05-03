@@ -17,6 +17,7 @@
 /*
  * Copyright (c) 2020 by Delphix. All rights reserved.
  * Copyright (c) 2020 by Datto Inc. All rights reserved.
+ * Copyright (c) 2026 CompEd Software Design srl.
  */
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -49,6 +50,8 @@ zstream_usage(void)
 	    "\n"
 	    "\tzstream token resume_token\n"
 	    "\n"
+	    "\tzstream resume -t resume_token [-i FILE]\n"
+	    "\n"
 	    "\tzstream redup [-v] FILE | ...\n");
 	exit(1);
 }
@@ -76,6 +79,8 @@ main(int argc, char *argv[])
 		return (zstream_do_recompress(argc - 1, argv + 1));
 	} else if (strcmp(subcommand, "token") == 0) {
 		return (zstream_do_token(argc - 1, argv + 1));
+	} else if (strcmp(subcommand, "resume") == 0) {
+		return (zstream_do_resume(argc - 1, argv + 1));
 	} else if (strcmp(subcommand, "redup") == 0) {
 		return (zstream_do_redup(argc - 1, argv + 1));
 	} else {
