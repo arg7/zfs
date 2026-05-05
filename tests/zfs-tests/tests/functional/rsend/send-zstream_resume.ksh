@@ -28,7 +28,7 @@
 # 1. Create source dataset with data of mixed record types (full and
 #    embedded records), then snapshot.
 # 2. Generate a cached full send stream.
-# 3. Start zfs receive -s but interrupt it partway through using zpipe -c
+# 3. Start zfs receive -s but interrupt it partway through using head -c
 #    to generate a resume token.
 # 4. Use zstream resume -t <token> -i <cached> to produce a resume stream
 #    directly on the receiving side (no master node contact).
@@ -65,10 +65,10 @@ log_must zfs snapshot $sendfs@snap1
 # Generate cached full send stream
 log_must eval "zfs send $sendfs@snap1 > $stream"
 
-# Interrupted receive to get a resume token.  zpipe -c exits with
+# Interrupted receive to get a resume token.  head -c stops at N bytes
 # code 142 after the byte limit, causing the pipeline to fail, but
 # zfs receive -s saves the resume state on the dataset.
-zfs send $sendfs@snap1 | zpipe -c $cut_bytes | zfs receive -s $recvfs
+zfs send $sendfs@snap1 | head -c $cut_bytes | zfs receive -s $recvfs
 # ignore the pipeline exit code; verify we got a token instead
 typeset TOKEN
 TOKEN=$(zfs get -H -o value receive_resume_token $recvfs)
