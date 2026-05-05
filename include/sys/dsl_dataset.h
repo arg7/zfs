@@ -106,6 +106,7 @@ struct zfs_bookmark_phys;
 #define	DS_FIELD_RESUME_OBJECT "com.delphix:resume_object"
 #define	DS_FIELD_RESUME_OFFSET "com.delphix:resume_offset"
 #define	DS_FIELD_RESUME_BYTES "com.delphix:resume_bytes"
+#define	DS_FIELD_RESUME_STREAM_OFFSET "com.delphix:resume_stream_offset"
 #define	DS_FIELD_RESUME_LARGEBLOCK "com.delphix:resume_largeblockok"
 #define	DS_FIELD_RESUME_EMBEDOK "com.delphix:resume_embedok"
 #define	DS_FIELD_RESUME_COMPRESSOK "com.delphix:resume_compressok"
@@ -250,6 +251,7 @@ typedef struct dsl_dataset {
 	uint64_t ds_resume_object[TXG_SIZE];
 	uint64_t ds_resume_offset[TXG_SIZE];
 	uint64_t ds_resume_bytes[TXG_SIZE];
+	uint64_t ds_resume_stream_offset[TXG_SIZE];
 
 	/* Protected by our dsl_dir's dd_lock */
 	list_t ds_prop_cbs;

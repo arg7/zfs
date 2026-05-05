@@ -33,6 +33,7 @@
  * Copyright (c) 2019, Allan Jude
  * Copyright (c) 2020 The FreeBSD Foundation [1]
  * Copyright (c) 2025, Rob Norris <robn@despairlabs.com>
+ * Copyright (c) 2026 CompEd Software Design srl.
  *
  * [1] Portions of this software were developed by Allan Jude
  *     under sponsorship from the FreeBSD Foundation.
@@ -2133,9 +2134,13 @@ dsl_dataset_sync(dsl_dataset_t *ds, zio_t *rio, dmu_tx_t *tx)
 		VERIFY0(zap_update(tx->tx_pool->dp_meta_objset,
 		    ds->ds_object, DS_FIELD_RESUME_BYTES, 8, 1,
 		    &ds->ds_resume_bytes[tx->tx_txg & TXG_MASK], tx));
+		VERIFY0(zap_update(tx->tx_pool->dp_meta_objset,
+		    ds->ds_object, DS_FIELD_RESUME_STREAM_OFFSET, 8, 1,
+		    &ds->ds_resume_stream_offset[tx->tx_txg & TXG_MASK], tx));
 		ds->ds_resume_object[tx->tx_txg & TXG_MASK] = 0;
 		ds->ds_resume_offset[tx->tx_txg & TXG_MASK] = 0;
 		ds->ds_resume_bytes[tx->tx_txg & TXG_MASK] = 0;
+		ds->ds_resume_stream_offset[tx->tx_txg & TXG_MASK] = 0;
 	}
 
 	dmu_objset_sync(ds->ds_objset, rio, tx);
@@ -2408,6 +2413,19 @@ get_receive_resume_token_impl(dsl_dataset_t *ds)
 	if (zap_lookup(dp->dp_meta_objset, ds->ds_object,
 	    DS_FIELD_RESUME_BYTES, sizeof (val), 1, &val) == 0) {
 		fnvlist_add_uint64(token_nv, "bytes", val);
+	}
+	/*
+	 * Include the stream offset in the nvlist for tools that want
+	 * to fast-forward.  Fall back to bytes_read for old datasets.
+	 */
+	if (zap_lookup(dp->dp_meta_objset, ds->ds_object,
+	    DS_FIELD_RESUME_STREAM_OFFSET, sizeof (val), 1, &val) == 0) {
+		fnvlist_add_uint64(token_nv, "stream_offset", val);
+	} else {
+		uint64_t bytes;
+		if (zap_lookup(dp->dp_meta_objset, ds->ds_object,
+		    DS_FIELD_RESUME_BYTES, sizeof (bytes), 1, &bytes) == 0)
+			fnvlist_add_uint64(token_nv, "stream_offset", bytes);
 	}
 	if (zap_lookup(dp->dp_meta_objset, ds->ds_object,
 	    DS_FIELD_RESUME_TOGUID, sizeof (val), 1, &val) == 0) {
