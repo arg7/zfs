@@ -105,7 +105,6 @@ scripts_zfs_tests_bin_PROGRAMS += %D%/stride_dd
 scripts_zfs_tests_bin_PROGRAMS += %D%/threadsappend
 %C%_threadsappend_LDADD = -lpthread
 
-scripts_zfs_tests_bin_PROGRAMS += %D%/zpipe
 
 scripts_zfs_tests_bin_PROGRAMS += %D%/ereports
 %C%_ereports_LDADD = \
