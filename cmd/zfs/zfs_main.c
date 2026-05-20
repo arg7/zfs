@@ -319,10 +319,10 @@ get_usage(zfs_help_t idx)
 		return (gettext("\tupgrade [-v]\n"
 		    "\tupgrade [-r] [-V version] <-a | filesystem ...>\n"));
 	case HELP_LIST:
-		return (gettext("\tlist [-Hp] [-j [--json-int]] [-r|-d max] "
-		    "[-o property[,...]] [-s property]...\n\t    "
-		    "[-S property]... [-t type[,...]] "
-		    "[filesystem|volume|snapshot] ...\n"));
+ 		return (gettext("\tlist [-Hp] [-j [--json-int]] [-r|-d max] "
+ 		    "[-o property[,...]] [-s property]...\n\t    "
+ 		    "[-S property]... [-t type[,...]] [-x expression] "
+ 		    "[filesystem|volume|snapshot] ...\n"));
 	case HELP_MOUNT:
 		return (gettext("\tmount [-j]\n"
 		    "\tmount [-flvO] [-o opts] <-a|-R filesystem|"
@@ -362,8 +362,8 @@ get_usage(zfs_help_t idx)
 	case HELP_SHARE:
 		return (gettext("\tshare [-l] <-a [nfs|smb] | filesystem>\n"));
 	case HELP_SNAPSHOT:
-		return (gettext("\tsnapshot [-r] [-o property=value] ... "
-		    "<filesystem|volume>@<snap> ...\n"));
+		return (gettext("\tsnapshot [-r] [-g properties] "
+		    "[-o property=value] ... <filesystem|volume>@<snap> ...\n"));
 	case HELP_UNMOUNT:
 		return (gettext("\tunmount [-fu] "
 		    "<-a | filesystem|mountpoint>\n"));
@@ -2456,7 +2456,7 @@ found3:;
 
 	/* run for each object */
 	ret = zfs_for_each(argc, argv, flags, types, NULL,
-	    &cb.cb_proplist, limit, get_callback, &cb);
+	    &cb.cb_proplist, limit, get_callback, &cb, NULL, NULL);
 
 	if (ret == 0 && cb.cb_json)
 		zcmd_print_json(cb.cb_jsobj);
@@ -2597,11 +2597,11 @@ zfs_do_inherit(int argc, char **argv)
 	cb.cb_received = received;
 
 	if (flags & ZFS_ITER_RECURSE) {
-		ret = zfs_for_each(argc, argv, flags, ZFS_TYPE_DATASET,
-		    NULL, NULL, 0, inherit_recurse_cb, &cb);
-	} else {
-		ret = zfs_for_each(argc, argv, flags, ZFS_TYPE_DATASET,
-		    NULL, NULL, 0, inherit_cb, &cb);
+ret = zfs_for_each(argc, argv, flags, ZFS_TYPE_DATASET,
+		    NULL, NULL, 0, inherit_recurse_cb, &cb, NULL, NULL);
+		} else {
+			ret = zfs_for_each(argc, argv, flags, ZFS_TYPE_DATASET,
+		    NULL, NULL, 0, inherit_cb, &cb, NULL, NULL);
 	}
 
 	return (ret);
@@ -2803,7 +2803,7 @@ zfs_do_upgrade(int argc, char **argv)
 		if (cb.cb_version == 0)
 			cb.cb_version = ZPL_VERSION;
 		ret = zfs_for_each(argc, argv, flags, ZFS_TYPE_FILESYSTEM,
-		    NULL, NULL, 0, upgrade_set_callback, &cb);
+		    NULL, NULL, 0, upgrade_set_callback, &cb, NULL, NULL);
 		(void) printf(gettext("%llu filesystems upgraded\n"),
 		    (u_longlong_t)cb.cb_numupgraded);
 		if (cb.cb_numsamegraded) {
@@ -2821,14 +2821,14 @@ zfs_do_upgrade(int argc, char **argv)
 
 		flags |= ZFS_ITER_RECURSE;
 		ret = zfs_for_each(0, NULL, flags, ZFS_TYPE_FILESYSTEM,
-		    NULL, NULL, 0, upgrade_list_callback, &cb);
+		    NULL, NULL, 0, upgrade_list_callback, &cb, NULL, NULL);
 
 		found = cb.cb_foundone;
 		cb.cb_foundone = B_FALSE;
 		cb.cb_newer = B_TRUE;
 
 		ret |= zfs_for_each(0, NULL, flags, ZFS_TYPE_FILESYSTEM,
-		    NULL, NULL, 0, upgrade_list_callback, &cb);
+		    NULL, NULL, 0, upgrade_list_callback, &cb, NULL, NULL);
 
 		if (!cb.cb_foundone && !found) {
 			(void) printf(gettext("All filesystems are "
@@ -3639,13 +3639,14 @@ zfs_do_userspace(int argc, char **argv)
  * '-r' is specified.
  */
 typedef struct list_cbdata {
-	boolean_t	cb_first;
-	boolean_t	cb_literal;
-	boolean_t	cb_scripted;
-	zprop_list_t	*cb_proplist;
-	boolean_t	cb_json;
-	nvlist_t	*cb_jsobj;
-	boolean_t	cb_json_as_int;
+ 	boolean_t	cb_first;
+ 	boolean_t	cb_literal;
+ 	boolean_t	cb_scripted;
+ 	zprop_list_t	*cb_proplist;
+ 	boolean_t	cb_json;
+ 	nvlist_t	*cb_jsobj;
+ 	boolean_t	cb_json_as_int;
+ 	char		*cb_filter_expr;
 } list_cbdata_t;
 
 /*
@@ -3893,6 +3894,620 @@ list_callback(zfs_handle_t *zhp, void *data)
 	return (0);
 }
 
+/*
+ * Expression filter for "zfs list -x <expr>".
+ *
+ * Grammar (operator precedence, highest to lowest):
+ *   expr       := or_expr
+ *   or_expr    := and_expr ( "||" and_expr )*
+ *   and_expr   := comparison ( "&&" comparison )*
+ *   comparison := primary ( op primary )?
+ *   primary    := "(" expr ")" | property_name
+ *
+ * Comparison operators: == != > < >= <=
+ * Presence eval:  a bare property name evaluates to true if it exists
+ *                 and has a non-hyphen value.
+ *
+ * Value parsing:
+ *   Numeric literals (guid, creation, txg, etc.) are parsed as uint64_t.
+ *   Size suffixes (K, M, G, T, P, E) are expanded to base-2 integers.
+ *   Time suffixes (d, h, m, s) are expanded to seconds for timestamp
+ *   properties (creation, mtime, atime, ctime, snapdev).
+ *   Everything else is compared as strings.
+ */
+
+typedef enum {
+	OP_AND,
+	OP_OR,
+	OP_EQ,
+	OP_NE,
+	OP_GT,
+	OP_LT,
+	OP_GE,
+	OP_LE,
+} op_type_t;
+
+typedef enum {
+	EXPR_NODE,
+	EXPR_COMPARISON,
+	EXPR_PRESENCE,
+} expr_kind_t;
+
+typedef struct expr_node expr_node_t;
+
+typedef struct {
+	char		*prop;
+	zfs_prop_t	prop_id;
+	char		*value;
+	op_type_t	op;
+} comp_t;
+
+typedef struct {
+	char		*prop;
+	zfs_prop_t	prop_id;
+} presence_t;
+
+struct expr_node {
+	expr_kind_t	kind;
+	op_type_t	op;		/* for AND/OR nodes, the operator */
+	union {
+		comp_t	comp;
+		presence_t	pres;
+	} u;
+	expr_node_t	*left;
+	expr_node_t	*right;
+};
+
+typedef struct {
+	const char	*str;
+	const char	*pos;
+	int		err;
+} parser_t;
+
+static void
+parser_init(parser_t *p, const char *str)
+{
+	p->str = str;
+	p->pos = str;
+	p->err = 0;
+}
+
+static void
+parser_skip_spaces(parser_t *p)
+{
+	while (*p->pos == ' ' || *p->pos == '\t')
+		p->pos++;
+}
+
+static boolean_t
+parser_peek_op(parser_t *p, const char *op)
+{
+	size_t len = strlen(op);
+	if (strncmp(p->pos, op, len) == 0) {
+		char c = p->pos[len];
+		if (c == '\0' || c == ' ' || c == '\t' || c == '(' || c == ')' ||
+		    (c >= '0' && c <= '9') || c == '"' || c == '-' ||
+		    isalpha((unsigned char)c) || c == '_' || c == ':' ||
+		    c == '.')
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+static void
+parser_consume_op(parser_t *p, const char *op)
+{
+	p->pos += strlen(op);
+	parser_skip_spaces(p);
+}
+
+static boolean_t
+parser_peek_binop(parser_t *p, op_type_t *op)
+{
+	parser_skip_spaces(p);
+	if (parser_peek_op(p, "&&")) { *op = OP_AND; return (B_TRUE); }
+	if (parser_peek_op(p, "||")) { *op = OP_OR;  return (B_TRUE); }
+	if (parser_peek_op(p, "==")) { *op = OP_EQ;  return (B_TRUE); }
+	if (parser_peek_op(p, "!=")) { *op = OP_NE;  return (B_TRUE); }
+	if (parser_peek_op(p, ">=")) { *op = OP_GE;  return (B_TRUE); }
+	if (parser_peek_op(p, "<=")) { *op = OP_LE;  return (B_TRUE); }
+	if (parser_peek_op(p, ">"))  { *op = OP_GT;  return (B_TRUE); }
+	if (parser_peek_op(p, "<"))  { *op = OP_LT;  return (B_TRUE); }
+	return (B_FALSE);
+}
+
+static boolean_t
+is_prop_char(char c)
+{
+	return (isalpha((unsigned char)c) || c == '_' || c == ':' ||
+	    c == '-' || (c >= '0' && c <= '9'));
+}
+
+static char *
+parser_parse_ident(parser_t *p)
+{
+	const char *start = p->pos;
+	parser_skip_spaces(p);
+	if (!is_prop_char(*p->pos)) {
+		p->err = 1;
+		return (NULL);
+	}
+	while (is_prop_char(*p->pos))
+		p->pos++;
+	size_t len = (size_t)(p->pos - start);
+	char *ident = safe_malloc(len + 1);
+	(void) strncpy(ident, start, len);
+	ident[len] = '\0';
+	return (ident);
+}
+
+static char *
+parser_parse_value(parser_t *p)
+{
+	const char *start = p->pos;
+	parser_skip_spaces(p);
+
+	/* quoted value */
+	if (*p->pos == '"') {
+		p->pos++;
+		start = p->pos;
+		while (*p->pos && *p->pos != '"')
+			p->pos++;
+		size_t len = (size_t)(p->pos - start);
+		if (*p->pos == '"')
+			p->pos++;
+		char *val = safe_malloc(len + 1);
+		(void) strncpy(val, start, len);
+		val[len] = '\0';
+		return (val);
+	}
+
+	/* unquoted value: alphanumeric, '-', '.', '/', ':' */
+	if (!is_prop_char(*p->pos) && *p->pos != '.' && *p->pos != '/' &&
+	    *p->pos != ' ' && *p->pos != '\t') {
+		p->err = 1;
+		return (NULL);
+	}
+	while (is_prop_char(*p->pos) || *p->pos == '.' || *p->pos == '/' ||
+	    *p->pos == ' ')
+		p->pos++;
+	size_t len = (size_t)(p->pos - start);
+	/* trim trailing spaces */
+	while (len > 0 && start[len - 1] == ' ')
+		len--;
+	char *val = safe_malloc(len + 1);
+	(void) strncpy(val, start, len);
+	val[len] = '\0';
+	return (val);
+}
+
+/*
+ * Parse size/time suffixes into a uint64_t.
+ * Size suffixes: K=1024, M=1024^2, G=1024^3, T=1024^4, P=1024^5, E=1024^6
+ * Time suffixes: d=86400, h=3600, m=60, s=1
+ * Plain numbers are parsed as-is.
+ */
+static uint64_t
+parse_value_numeric(const char *val, boolean_t *is_numeric)
+{
+	char *end;
+	uint64_t num = strtoull(val, &end, 10);
+
+	if (*end == '\0') {
+		*is_numeric = B_TRUE;
+		return (num);
+	}
+
+	/* size suffix */
+	uint64_t multiplier = 1;
+	boolean_t is_size = B_FALSE;
+	switch (*end) {
+	case 'K': case 'k':
+		multiplier = 1024ULL; is_size = B_TRUE; break;
+	case 'M':
+		multiplier = 1024ULL * 1024; is_size = B_TRUE; break;
+	case 'G': case 'g':
+		multiplier = 1024ULL * 1024 * 1024; is_size = B_TRUE; break;
+	case 'T': case 't':
+		multiplier = 1024ULL * 1024 * 1024 * 1024; is_size = B_TRUE; break;
+	case 'P': case 'p':
+		multiplier = 1024ULL * 1024 * 1024 * 1024 * 1024; is_size = B_TRUE; break;
+	case 'E': case 'e':
+		multiplier = 1024ULL * 1024 * 1024 * 1024 * 1024 * 1024; is_size = B_TRUE; break;
+	case 'd':
+		multiplier = 86400ULL; is_size = B_TRUE; break;
+	case 'h':
+		multiplier = 3600ULL; is_size = B_TRUE; break;
+	case 'm':
+		multiplier = 60ULL; is_size = B_TRUE; break;
+	case 's':
+		multiplier = 1ULL; is_size = B_TRUE; break;
+	}
+
+	if (is_size) {
+		*is_numeric = B_TRUE;
+		return (num * multiplier);
+	}
+
+	*is_numeric = B_FALSE;
+	return (0);
+}
+
+static expr_node_t *
+parse_comparison(parser_t *p);
+static expr_node_t *
+parse_or(parser_t *p);
+static expr_node_t *
+parse_and(parser_t *p);
+static void
+expr_free(expr_node_t *node);
+
+static expr_node_t *
+parse_primary(parser_t *p)
+{
+	parser_skip_spaces(p);
+
+	if (*p->pos == '(') {
+		p->pos++;
+		expr_node_t *node = parse_or(p);
+		if (p->err || node == NULL) {
+			free(node);
+			p->err = 1;
+			return (NULL);
+		}
+		parser_skip_spaces(p);
+		if (*p->pos != ')') {
+			p->err = 1;
+			expr_free(node);
+			return (NULL);
+		}
+		p->pos++;
+		return (node);
+	}
+
+	char *ident = parser_parse_ident(p);
+	if (p->err || ident == NULL) {
+		p->err = 1;
+		return (NULL);
+	}
+
+/* Check if this is a property name followed by an operator */
+	parser_skip_spaces(p);
+	op_type_t op;
+	if (parser_peek_op(p, "=="))  { op = OP_EQ;  parser_consume_op(p, "=="); }
+	else if (parser_peek_op(p, "!=")) { op = OP_NE; parser_consume_op(p, "!="); }
+	else if (parser_peek_op(p, ">=")) { op = OP_GE; parser_consume_op(p, ">="); }
+	else if (parser_peek_op(p, "<=")) { op = OP_LE; parser_consume_op(p, "<="); }
+	else if (parser_peek_op(p, ">"))  { op = OP_GT; parser_consume_op(p, ">"); }
+	else if (parser_peek_op(p, "<"))  { op = OP_LT; parser_consume_op(p, "<"); }
+	else {
+		op = 0;
+	}
+
+	if (op != 0) {
+		/* This is a comparison */
+		expr_node_t *node = safe_malloc(sizeof (expr_node_t));
+		node->kind = EXPR_COMPARISON;
+		node->u.comp.op = op;
+		node->u.comp.prop = ident;
+		node->u.comp.prop_id = zfs_name_to_prop(ident);
+		if (node->u.comp.prop_id == ZPROP_USERPROP &&
+		    !zfs_prop_user(ident)) {
+			node->u.comp.prop_id = ZPROP_INVAL;
+		}
+		node->u.comp.value = parser_parse_value(p);
+		if (p->err || node->u.comp.value == NULL) {
+			p->err = 1;
+			expr_free(node);
+			return (NULL);
+		}
+		node->left = NULL;
+		node->right = NULL;
+		return (node);
+	}
+
+	/* Presence evaluation */
+	expr_node_t *node = safe_malloc(sizeof (expr_node_t));
+node->kind = EXPR_PRESENCE;
+ 	node->op = OP_AND; /* unused for presence nodes */
+	node->u.pres.prop = ident;
+	node->u.pres.prop_id = zfs_name_to_prop(ident);
+	if (node->u.pres.prop_id == ZPROP_USERPROP &&
+	    !zfs_prop_user(ident)) {
+		node->u.pres.prop_id = ZPROP_INVAL;
+	}
+	node->left = NULL;
+	node->right = NULL;
+	return (node);
+}
+
+static expr_node_t *
+parse_comparison(parser_t *p)
+{
+	expr_node_t *node = parse_primary(p);
+	if (p->err || node == NULL)
+		return (NULL);
+
+	parser_skip_spaces(p);
+	op_type_t op;
+	while (parser_peek_binop(p, &op) && op != OP_AND && op != OP_OR) {
+		expr_node_t *newnode = safe_malloc(sizeof (expr_node_t));
+		newnode->kind = EXPR_NODE;
+		newnode->op = op;
+		newnode->left = node;
+		newnode->right = parse_primary(p);
+		if (p->err || newnode->right == NULL) {
+			p->err = 1;
+			expr_free(newnode);
+			return (NULL);
+		}
+		node = newnode;
+		parser_skip_spaces(p);
+	}
+
+	return (node);
+}
+
+static expr_node_t *
+parse_or(parser_t *p)
+{
+	expr_node_t *node = parse_and(p);
+	if (p->err || node == NULL)
+		return (NULL);
+
+	parser_skip_spaces(p);
+	while (parser_peek_op(p, "||")) {
+		expr_node_t *newnode = safe_malloc(sizeof (expr_node_t));
+		newnode->kind = EXPR_NODE;
+		newnode->op = OP_OR;
+		newnode->left = node;
+		parser_consume_op(p, "||");
+		newnode->right = parse_and(p);
+		if (p->err || newnode->right == NULL) {
+			p->err = 1;
+			expr_free(newnode);
+			return (NULL);
+		}
+		node = newnode;
+		parser_skip_spaces(p);
+	}
+
+	return (node);
+}
+
+static expr_node_t *
+parse_and(parser_t *p)
+{
+	expr_node_t *node = parse_comparison(p);
+	if (p->err || node == NULL)
+		return (NULL);
+
+	parser_skip_spaces(p);
+	while (parser_peek_op(p, "&&")) {
+		expr_node_t *newnode = safe_malloc(sizeof (expr_node_t));
+		newnode->kind = EXPR_NODE;
+		newnode->op = OP_AND;
+		newnode->left = node;
+		parser_consume_op(p, "&&");
+		newnode->right = parse_comparison(p);
+		if (p->err || newnode->right == NULL) {
+			p->err = 1;
+			expr_free(newnode);
+			return (NULL);
+		}
+		node = newnode;
+		parser_skip_spaces(p);
+	}
+
+	return (node);
+}
+
+static expr_node_t *
+parse_expression(parser_t *p)
+{
+	expr_node_t *node = parse_or(p);
+	if (p->err || node == NULL)
+		return (NULL);
+
+	parser_skip_spaces(p);
+	if (*p->pos != '\0')
+		p->err = 1;
+
+	return (node);
+}
+
+static void
+expr_free(expr_node_t *node)
+{
+	if (node == NULL)
+		return;
+	expr_free(node->left);
+	expr_free(node->right);
+	if (node->kind == EXPR_COMPARISON) {
+		free(node->u.comp.prop);
+		free(node->u.comp.value);
+	} else if (node->kind == EXPR_PRESENCE) {
+		free(node->u.pres.prop);
+	}
+	free(node);
+}
+
+/*
+ * Determine if a property is a "size" property that should have
+ * suffix expansion (K, M, G, T, P, E).
+ */
+static boolean_t
+is_size_property(zfs_prop_t prop)
+{
+	switch (prop) {
+	case ZFS_PROP_USED:
+	case ZFS_PROP_AVAILABLE:
+	case ZFS_PROP_REFERENCED:
+	case ZFS_PROP_COMPRESSRATIO:
+	case ZFS_PROP_QUOTA:
+	case ZFS_PROP_RESERVATION:
+	case ZFS_PROP_VOLSIZE:
+	case ZFS_PROP_VOLBLOCKSIZE:
+	case ZFS_PROP_USEDCHILD:
+	case ZFS_PROP_USEDSNAP:
+	case ZFS_PROP_USEDDS:
+case ZFS_PROP_REFRESERVATION:
+		return (B_TRUE);
+	default:
+		return (B_FALSE);
+	}
+}
+
+/*
+ * Determine if a property is a "time" property (timestamp in seconds).
+ */
+static boolean_t
+is_time_property(zfs_prop_t prop)
+{
+	switch (prop) {
+	case ZFS_PROP_CREATION:
+	case ZFS_PROP_ATIME:
+		return (B_TRUE);
+	default:
+		return (B_FALSE);
+	}
+}
+
+/*
+ * Evaluate the expression filter against a dataset.
+ * Returns 1 if the dataset matches, 0 if it doesn't.
+ */
+static int
+expr_evaluate(expr_node_t *node, zfs_handle_t *zhp)
+{
+	if (node == NULL)
+		return (1);
+
+	if (node->kind == EXPR_NODE) {
+		int left_val = expr_evaluate(node->left, zhp);
+		if (node->op == OP_AND && !left_val)
+			return (0); /* short-circuit */
+		if (node->op == OP_OR && left_val)
+			return (1); /* short-circuit */
+		int right_val = expr_evaluate(node->right, zhp);
+		return (node->op == OP_AND) ? (left_val && right_val) :
+		    (left_val || right_val);
+	}
+
+	if (node->kind == EXPR_PRESENCE) {
+		char propval[ZFS_MAXPROPLEN];
+		boolean_t found = B_FALSE;
+
+		if (node->u.pres.prop_id == ZPROP_USERPROP) {
+			nvlist_t *userprops = zfs_get_user_props(zhp);
+			nvlist_t *propnv;
+			if (userprops != NULL &&
+			    nvlist_lookup_nvlist(userprops,
+			    node->u.pres.prop, &propnv) == 0) {
+				const char *val = fnvlist_lookup_string(propnv,
+				    ZPROP_VALUE);
+				if (val != NULL && strcmp(val, "-") != 0 &&
+				    val[0] != '\0')
+					found = B_TRUE;
+			}
+		} else if (node->u.pres.prop_id != ZPROP_INVAL) {
+			if (zfs_prop_get(zhp, node->u.pres.prop_id, propval,
+			    sizeof (propval), NULL, NULL, 0, B_TRUE) == 0) {
+				if (strcmp(propval, "-") != 0 &&
+				    propval[0] != '\0')
+					found = B_TRUE;
+			}
+		}
+		return (found ? 1 : 0);
+	}
+
+	/* EXPR_COMPARISON */
+	comp_t *c = &node->u.comp;
+	char lbuf[ZFS_MAXPROPLEN];
+	const char *lstr = NULL;
+	uint64_t lnum = 0;
+	boolean_t lvalid = B_FALSE;
+	boolean_t r_numeric;
+	uint64_t rnum;
+
+	if (c->prop_id == ZPROP_USERPROP) {
+		nvlist_t *userprops = zfs_get_user_props(zhp);
+		nvlist_t *propnv;
+		if (userprops != NULL &&
+		    nvlist_lookup_nvlist(userprops, c->prop, &propnv) == 0) {
+			lstr = fnvlist_lookup_string(propnv, ZPROP_VALUE);
+			if (lstr != NULL)
+				lvalid = B_TRUE;
+		}
+	} else if (c->prop_id != ZPROP_INVAL) {
+		if (zfs_prop_get(zhp, c->prop_id, lbuf,
+		    sizeof (lbuf), NULL, NULL, 0, B_TRUE) == 0) {
+			lstr = lbuf;
+			lvalid = B_TRUE;
+		}
+	}
+
+	if (!lvalid)
+		return (0);
+
+	rnum = parse_value_numeric(c->value, &r_numeric);
+
+	/* Determine comparison mode */
+	boolean_t l_numeric = B_FALSE;
+	if (c->prop_id != ZPROP_INVAL) {
+		if (c->prop_id == ZFS_PROP_NAME) {
+			l_numeric = B_FALSE;
+		} else if (zfs_prop_is_string(c->prop_id)) {
+			l_numeric = B_FALSE;
+		} else {
+			l_numeric = B_TRUE;
+		}
+	} else if (is_size_property(c->prop_id) ||
+	    is_time_property(c->prop_id)) {
+		l_numeric = B_TRUE;
+	} else {
+		/* For user props, check if value looks numeric */
+		char *end;
+		strtoull(lstr, &end, 10);
+		l_numeric = (*end == '\0');
+	}
+
+	if (l_numeric) {
+		lnum = strtoull(lstr, NULL, 10);
+	}
+
+	if (l_numeric && r_numeric) {
+		switch (c->op) {
+		case OP_EQ: return (lnum == rnum);
+		case OP_NE: return (lnum != rnum);
+		case OP_GT: return (lnum > rnum);
+		case OP_LT: return (lnum < rnum);
+		case OP_GE: return (lnum >= rnum);
+		case OP_LE: return (lnum <= rnum);
+		default: break;
+		}
+	} else {
+		int cmp = strcmp(lstr, c->value);
+		switch (c->op) {
+		case OP_EQ: return (cmp == 0);
+		case OP_NE: return (cmp != 0);
+		case OP_GT: return (cmp > 0);
+		case OP_LT: return (cmp < 0);
+		case OP_GE: return (cmp >= 0);
+		case OP_LE: return (cmp <= 0);
+		default: break;
+		}
+	}
+
+	return (0);
+}
+
+static int
+zfs_filter_expression(zfs_handle_t *zhp, void *tree)
+{
+	return (expr_evaluate((expr_node_t *)tree, zhp));
+}
+
 static int
 zfs_do_list(int argc, char **argv)
 {
@@ -3916,7 +4531,7 @@ zfs_do_list(int argc, char **argv)
 	};
 
 	/* check options */
-	while ((c = getopt_long(argc, argv, "jHS:d:o:prs:t:", long_options,
+	while ((c = getopt_long(argc, argv, "jHS:d:o:prs:t:x:", long_options,
 	    NULL)) != -1) {
 		switch (c) {
 		case 'o':
@@ -4001,6 +4616,9 @@ zfs_do_list(int argc, char **argv)
 found3:;
 			}
 			break;
+		case 'x':
+			cb.cb_filter_expr = optarg;
+			break;
 		case ':':
 			(void) fprintf(stderr, gettext("missing argument for "
 			    "'%c' option\n"), optopt);
@@ -4054,22 +4672,40 @@ found3:;
 	 * then we can use "simple" mode and avoid populating the properties
 	 * nvlist.
 	 */
+	expr_node_t *filter_tree = NULL;
+	if (cb.cb_filter_expr != NULL) {
+		parser_t parser;
+		parser_init(&parser, cb.cb_filter_expr);
+		filter_tree = parse_expression(&parser);
+		if (parser.err || filter_tree == NULL) {
+			(void) fprintf(stderr, gettext(
+			    "invalid expression '%s'\n"),
+			    cb.cb_filter_expr);
+			expr_free(filter_tree);
+			zprop_free_list(cb.cb_proplist);
+			zfs_free_sort_columns(sortcol);
+			return (1);
+		}
+	}
+
 	if (zfs_list_only_by_fast(cb.cb_proplist) &&
-	    zfs_sort_only_by_fast(sortcol))
+	    zfs_sort_only_by_fast(sortcol) && filter_tree == NULL)
 		flags |= ZFS_ITER_SIMPLE;
 
 	ret = zfs_for_each(argc, argv, flags, types, sortcol, &cb.cb_proplist,
-	    limit, list_callback, &cb);
+	    limit, list_callback, &cb, filter_tree,
+	    zfs_filter_expression);
 
 	if (ret == 0 && cb.cb_json)
 		zcmd_print_json(cb.cb_jsobj);
 	else if (ret != 0 && cb.cb_json)
 		nvlist_free(cb.cb_jsobj);
 
-	zprop_free_list(cb.cb_proplist);
-	zfs_free_sort_columns(sortcol);
+zprop_free_list(cb.cb_proplist);
+ 	zfs_free_sort_columns(sortcol);
+ 	expr_free(filter_tree);
 
-	if (ret == 0 && cb.cb_first && !cb.cb_scripted)
+ 	if (ret == 0 && cb.cb_first && !cb.cb_scripted)
 		(void) fprintf(stderr, gettext("no datasets available\n"));
 
 	return (ret);
@@ -4625,7 +5261,7 @@ zfs_do_set(int argc, char **argv)
 	}
 
 	ret = zfs_for_each(argc - ds_start, argv + ds_start, 0,
-	    ZFS_TYPE_DATASET, NULL, NULL, 0, set_callback, &cb);
+	    ZFS_TYPE_DATASET, NULL, NULL, 0, set_callback, &cb, NULL, NULL);
 
 error:
 	nvlist_free(cb.cb_proplist);
@@ -4636,6 +5272,7 @@ typedef struct snap_cbdata {
 	nvlist_t *sd_nvl;
 	boolean_t sd_recursive;
 	const char *sd_snapname;
+	const char *sd_getprops;
 } snap_cbdata_t;
 
 static int
@@ -4685,7 +5322,7 @@ zfs_do_snapshot(int argc, char **argv)
 		nomem();
 
 	/* check options */
-	while ((c = getopt(argc, argv, "ro:")) != -1) {
+	while ((c = getopt(argc, argv, "g:ro:")) != -1) {
 		switch (c) {
 		case 'o':
 			if (!parseprop(props, optarg)) {
@@ -4697,6 +5334,9 @@ zfs_do_snapshot(int argc, char **argv)
 		case 'r':
 			sd.sd_recursive = B_TRUE;
 			multiple_snaps = B_TRUE;
+			break;
+		case 'g':
+			sd.sd_getprops = optarg;
 			break;
 		case '?':
 			(void) fprintf(stderr, gettext("invalid option '%c'\n"),
@@ -4734,6 +5374,111 @@ zfs_do_snapshot(int argc, char **argv)
 	}
 
 	ret = zfs_snapshot_nvl(g_zfs, sd.sd_nvl, props);
+	if (ret == 0 && sd.sd_getprops != NULL) {
+		nvlist_t *snaps = sd.sd_nvl;
+		nvpair_t *elem = NULL;
+		char *props_copy = strndup(sd.sd_getprops,
+		    strlen(sd.sd_getprops));
+		if (props_copy == NULL)
+			nomem();
+
+		char **proplist = NULL;
+		int nprops = 0;
+		for (char *tok = strtok(props_copy, ","); tok != NULL;
+		    tok = strtok(NULL, ",")) {
+			proplist = realloc(proplist,
+			    sizeof (char *) * (nprops + 1));
+			if (proplist == NULL)
+				nomem();
+			proplist[nprops++] = tok;
+		}
+
+		for (elem = nvlist_next_nvpair(snaps, elem);
+		    elem != NULL;
+		    elem = nvlist_next_nvpair(snaps, elem)) {
+			const char *snapname = nvpair_name(elem);
+			char *atp = strchr((char *)snapname, '@');
+			if (atp == NULL)
+				continue;
+			*atp = '\0';
+			char *fsname = strndup(snapname, atp - snapname);
+			*atp = '@';
+			if (fsname == NULL)
+				nomem();
+
+			zfs_handle_t *fs_zhp = zfs_open(g_zfs, fsname,
+			    ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME);
+			free(fsname);
+			if (fs_zhp == NULL)
+				continue;
+
+			/* Build snapshot name */
+			char *fullsnap;
+			if (asprintf(&fullsnap, "%s@%s",
+			    zfs_get_name(fs_zhp), sd.sd_snapname) == -1) {
+				zfs_close(fs_zhp);
+				continue;
+			}
+
+			zfs_handle_t *snap_zhp = zfs_open(g_zfs, fullsnap,
+			    ZFS_TYPE_SNAPSHOT);
+
+			for (int i = 0; i < nprops; i++) {
+				char buf[ZFS_MAXPROPLEN];
+				boolean_t is_user = zfs_prop_user(proplist[i]);
+				const char *val = NULL;
+				zfs_handle_t *prop_zhp = fs_zhp;
+
+				if (strcmp(proplist[i], "name") == 0) {
+					val = fullsnap;
+				} else if (is_user) {
+					nvlist_t *uprops =
+					    zfs_get_user_props(fs_zhp);
+					nvlist_t *propval;
+					if (nvlist_lookup_nvlist(
+					    uprops, proplist[i],
+					    &propval) == 0) {
+						val =
+						    fnvlist_lookup_string(
+						    propval,
+						    ZPROP_VALUE);
+					}
+				} else {
+					if (snap_zhp != NULL)
+						prop_zhp = snap_zhp;
+					zfs_prop_t prop =
+					    zfs_name_to_prop(proplist[i]);
+					if (prop != ZPROP_INVAL &&
+					    zfs_prop_valid_for_type(
+					    prop, zfs_get_type(prop_zhp),
+					    B_FALSE)) {
+						if (zfs_prop_get(prop_zhp, prop,
+						    buf, sizeof (buf),
+						    NULL, NULL, 0,
+						    B_TRUE) == 0) {
+							val = buf;
+						}
+					}
+				}
+
+				if (i > 0)
+					printf(",");
+				if (val == NULL)
+					printf("-");
+				else
+					printf("%s", val);
+			}
+			printf("\n");
+
+			free(fullsnap);
+			if (snap_zhp != NULL)
+				zfs_close(snap_zhp);
+			zfs_close(fs_zhp);
+		}
+
+		free(proplist);
+		free(props_copy);
+	}
 	nvlist_free(sd.sd_nvl);
 	nvlist_free(props);
 	if (ret != 0 && multiple_snaps)
@@ -6972,7 +7717,7 @@ zfs_do_holds(int argc, char **argv)
 		 *  1. collect holds data, set format options
 		 */
 		ret = zfs_for_each(1, argv + i, flags, types, NULL, NULL, limit,
-		    holds_callback, &cb);
+		    holds_callback, &cb, NULL, NULL);
 		if (ret != 0)
 			errors = B_TRUE;
 	}
@@ -8681,7 +9426,7 @@ load_unload_keys(int argc, char **argv, boolean_t loadkey)
 
 	ret = zfs_for_each(argc, argv, flags,
 	    ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME, NULL, NULL, 0,
-	    load_key_callback, &cb);
+	    load_key_callback, &cb, NULL, NULL);
 
 	if (cb.cb_noop || (cb.cb_recursive && cb.cb_numattempted != 0)) {
 		(void) printf(gettext("%llu / %llu key(s) successfully %s\n"),
