@@ -42,7 +42,7 @@
 .Cm snapshot
 .Op Fl r
 .Oo Fl o Ar property Ns = Ns Ar value Oc Ns …
-.Ar dataset Ns @ Ns Ar snapname Ns …
+.Oc Fl g Ar property Ns Oo , Ns Ar property Oc Ns …
 .
 .Sh DESCRIPTION
 Creates a snapshot of a dataset or multiple snapshots of different
@@ -72,6 +72,25 @@ Set the specified property; see
 for details.
 .It Fl r
 Recursively create snapshots of all descendent datasets
+.It Fl g Ar property Ns Oo , Ns Ar property Oc Ns …
+Output a CSV line with the specified property values for each
+created snapshot.
+The dataset name is not included by default;
+add
+.Sy name
+to the property list if needed.
+Built-in properties (e.g.,
+.Sy guid ,
+.Sy creation )
+and user properties (e.g.,
+.Sy com:foo:bar )
+are supported.
+Unknown or invalid properties output
+.Sy - .
+If snapshot creation fails, no output is produced.
+With
+.Fl r ,
+one CSV line is output per created snapshot.
 .El
 .
 .Sh EXAMPLES

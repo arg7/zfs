@@ -30,6 +30,10 @@
 .Nd manipulate ZFS send streams
 .Sh SYNOPSIS
 .Nm
+.Op Fl t Ar token
+.Op Fl i Ar file
+.Cm command Op Ar args Ns ...
+.Nm
 .Cm dump
 .Op Fl Cvd
 .Op Ar file
@@ -49,9 +53,31 @@
 .Cm token
 .Ar resume_token
 .Nm
+.Cm token
+.Fl g
+.Op Fl i Ar file
+.Nm
 .Cm recompress
 .Op Fl l Ar level
 .Ar algorithm
+.Nm
+.Cm resume
+.Fl t Ar token
+.Op Fl i Ar file
+.Op Fl o Ar offset
+.Op Fl c Ar size
+.Op Fl S
+.Op Fl H Ar header_file
+.Nm
+.Cm split
+.Op Fl i Ar file
+.Fl c Ar size
+.Op Fl o Ar prefix
+.Nm
+.Cm join
+.Op Fl i Ar head
+.Ar partial Ns ...
+.
 .
 .Sh DESCRIPTION
 The
@@ -59,6 +85,28 @@ The
 utility manipulates ZFS send streams output by the
 .Sy zfs send
 command.
+.Ss Global flags
+The following flags may be specified
+.Em before
+the subcommand name to control input setup for all subcommands:
+.Bl -tag -width "-t"
+.It Fl t Ar token
+Fast-rewind: decode the resume
+.Ar token
+to obtain the stream byte offset
+.Pq if present in the token ,
+seek the input file to that point, and validate the position with a probe read.
+This eliminates the linear scan normally required to reach the resume point,
+making resume O(1) on stream size.
+Requires
+.Fl i Ar file
+with seekable input.
+.It Fl i Ar file
+Input file.
+Required when
+.Fl t
+is used; optional otherwise (subcommands default to stdin).
+.El
 .Bl -tag -width ""
 .It Xo
 .Nm
@@ -92,7 +140,34 @@ alias is provided for compatibility and is equivalent to running
 .Cm token
 .Ar resume_token
 .Xc
-Dumps zfs resume token information
+Dumps ZFS resume token information, decoding the nvlist fields
+.Pq object, offset, toguid, etc.\&
+from the base64-encoded token string.
+.It Xo
+.Nm
+.Cm token
+.Fl g
+.Op Fl i Ar file
+.Xc
+Generate a resume token from a
+.Pq possibly truncated
+send stream.
+Reads the stream from
+.Ar file
+or stdin, scans to the last complete record, and outputs a resume token
+on stdout that can later be used with
+.Nm zfs Cm send Fl t Ar token
+or
+.Nm zstream Cm resume Fl t Ar token .
+The input need not contain a
+.Sy DRR_END
+record; a truncated stream at any record boundary is valid.
+.Bl -tag -width "-i"
+.It Fl g
+Generate mode: produce a resume token from the input stream.
+.It Fl i Ar file
+Input stream file (default: stdin).
+.El
 .It Xo
 .Nm
 .Cm decompress
@@ -194,6 +269,156 @@ Only needed for algorithms where the level is not implied as part of the name
 of the algorithm (e.g. gzip-3 does not require it, while zstd does, if a
 non-default level is desired).
 .El
+.It Xo
+.Nm
+.Cm resume
+.Fl t Ar token
+.Op Fl i Ar file
+.Op Fl o Ar offset
+.Op Fl c Ar size
+.Op Fl S
+.Op Fl H Ar header_file
+.Xc
+Read a cached send stream from
+.Ar file
+or stdin, and produce on stdout a resume stream starting at the point
+specified by the resume
+.Ar token .
+The output can be piped directly to
+.Nm zfs Cm receive Fl s .
+.Pp
+The resume token is typically obtained from a failed receive
+.Pq Nm zfs Cm receive Fl s
+or generated from a truncated stream with
+.Nm zstream Cm token Fl g .
+.Bl -tag -width "-o"
+.It Fl t Ar token
+Resume token (required).
+Also accepted as the global
+.Fl t
+flag before the subcommand name, which additionally seeks the input file.
+.It Fl i Ar file
+Input cached send stream file (default: stdin).
+.It Fl o Ar offset
+Explicit stream byte offset in hex.
+Overrides the
+.Sy stream_offset
+field in the resume token.
+Used when the token lacks the
+.Sy stream_offset
+key or a manual override is desired.
+The offset is validated with a probe read before streaming begins.
+.It Fl c Ar size
+Cut stream after
+.Ar size
+bytes.
+Write at most
+.Ar size
+bytes of resume stream, then stop without writing a
+.Sy DRR_END
+record.
+Useful when producing partial resume chunks to be reassembled with
+.Nm zstream Cm join .
+.It Fl S
+Skip-seek mode.
+Do not seek within the input file and do not filter records by
+resume point.
+All records after
+.Sy DRR_BEGIN
+are emitted verbatim with recomputed checksums.
+The caller is responsible for pre-positioning stdin at the resume point
+.Pq e.g., using Xr tail 1 Fl c .
+Must be used together with
+.Fl H
+to provide the original
+.Sy DRR_BEGIN
+header, since a pre-positioned stream lacks it.
+.It Fl H Ar header
+File containing the original
+.Sy DRR_BEGIN
+record and its nvlist payload
+.Pq e.g., the first chunk of a split stream ,
+or a data URI of the form
+.Sy data: Ns Oo Ar type Oc Ns Sy \&;base64, Ns Ar data .
+Used with
+.Fl S
+when the piped input has been pre-positioned past the
+.Sy DRR_BEGIN
+record.
+.El
+.It Xo
+.Nm
+.Cm split
+.Op Fl i Ar file
+.Fl c Ar size
+.Op Fl o Ar prefix
+.Xc
+Split a full send stream into fixed-size, record-aligned chunks
+that can be reassembled with
+.Nm zstream Cm join .
+Each chunk begins with a
+.Sy DRR_BEGIN
+record so it is a self-describing stream fragment.
+Chunks are written to files named
+.Ar prefix Ns Sy \&. Ns Ar NNN
+.Pq zero-padded to 3 digits .
+.Pp
+The input stream may be a regular file or a pipe (stdin).
+On pipe input, a record that would exceed the chunk size is buffered
+in memory and written as the first record of the next chunk.
+This avoids the need for seeking.
+.Bl -tag -width "-o"
+.It Fl i Ar file
+Input stream file (default: stdin).
+.It Fl c Ar size
+Maximum uncompressed bytes per chunk (required).
+Chunks are aligned to record boundaries, so actual chunk sizes may be
+slightly smaller.
+The chunk size must be at least 512 and should be large enough to
+accommodate the largest record in the stream.
+.It Fl o Ar prefix
+Output file prefix (default:
+.Sy chunk ) .
+.El
+.It Xo
+.Nm
+.Cm join
+.Op Fl i Ar head
+.Ar partial Ns ...
+.Xc
+Join a send stream head fragment with one or more partial resume
+streams into a single output stream.
+The head fragment contains the
+.Sy DRR_BEGIN
+record and the initial data up to the resume point.
+The partial fragments are produced by
+.Nm zstream Cm resume Fl c Ar size
+and are concatenated in order.
+.Pp
+Exit codes:
+.Bl -tag -width "0" -compact
+.It 0
+Stream is complete
+.Pq Sy DRR_END No written .
+.It 1
+Error.
+.It 2
+Stream is incomplete
+.Pq no Sy DRR_END .
+.El
+.Bl -tag -width "-i"
+.It Fl i Ar head
+Head fragment file.
+If omitted, the first positional argument is used as the head.
+If no positional arguments are given, stdin is used as the head.
+.El
+.Ar partial
+is one or more partial stream files to append after the head.
+Each partial must begin with a valid
+.Sy DRR_BEGIN
+record; these are skipped
+.Pq they duplicate the head's DRR_BEGIN ,
+and only the data records are copied.
 .El
 .
 .Sh EXAMPLES
@@ -226,6 +451,29 @@ to drop the bogus record, then receive into a new dataset.
 .No # Nm zfs Ar send Ar ... | Nm zstream drop_record Ar 3545761,18446744073709486080 | \
 Nm zfs recv Ar ...
 .Ed
+.
+.Ss Piped resume from pre-positioned stream
+When sending a very large snapshot stream, it is often split into chunks
+.Pq Nm zstream Cm split
+for transport.
+To resume from a specific chunk without seeking:
+.Bd -literal
+.No # Nm zstd Fl d Ar chunk_*.zfs | Nm tail Fl c Sy + Ns Va STREAM_OFFSET | \
+    Nm zstream Cm resume Fl t Ar TOKEN Fl H Ar chunk_0000.zfs Fl S | \
+    Nm zfs Cm recv Fl s Ar pool/fs
+.Ed
+.Pp
+The
+.Va STREAM_OFFSET
+value is obtained from the resume token
+.Pq Nm zstream Cm token Ar TOKEN ,
+and
+.Ar chunk_0000.zfs
+contains the original
+.Sy DRR_BEGIN
+record.
+.Fl S
+disables seeking and resume-point filtering since the input is already positioned.
 .Sh SEE ALSO
 .Xr zdb 8 ,
 .Xr zfs 8 ,
