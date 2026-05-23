@@ -61,3 +61,5 @@
 /idmap_util
 /statx
 /setlease
+/xexpr_test
+/zstream_split_test
