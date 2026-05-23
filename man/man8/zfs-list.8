@@ -47,6 +47,7 @@
 .Oo Fl s Ar property Oc Ns …
 .Oo Fl S Ar property Oc Ns …
 .Oo Fl t Ar type Ns Oo , Ns Ar type Oc Ns … Oc
+.Oc Fl x Ar expression
 .Oo Ar filesystem Ns | Ns Ar volume Ns | Ns Ar snapshot Oc Ns …
 .
 .Sh DESCRIPTION
@@ -180,6 +181,49 @@ can be used as aliases for
 .Sy snapshot ,
 or
 .Sy volume .
+.It Fl x Ar expression
+Filter datasets by evaluating a logical expression against their properties.
+Datasets that do not match the expression are excluded from the output.
+The expression supports the following operators (highest to lowest precedence):
+.Bl -bullet -compact
+.
+.It Parentheses
+.Ns ( Ns Ar expr Ns )
+for grouping and precedence override.
+.
+.It Comparison operators
+.Ns == , != , > , < , >= , <=
+comparing a property against a literal value.
+.
+.It Logical AND
+.Ns &&
+.
+.It Logical OR
+.Ns ||
+.
+.El
+.Pp
+A bare property name acts as a presence check (evaluates to true if the
+property exists and has a non-empty value).
+Size suffixes
+.Sy K , M , G , T , P , E
+are expanded to base-2 byte values.
+Time suffixes
+.Sy d , h , m , s
+are expanded to seconds.
+Unknown properties evaluate to false rather than causing an error.
+.Pp
+Examples:
+.Bd -literal -offset Ds
+# List datasets with more than 1G used
+# Nm zfs Cm list Fl x Ar \(dqused > 1G\(dq
+
+# List snapshots with a custom tag
+# Nm zfs Cm list Fl t snapshot Fl x Ar \(dqcom:backup:weekly\(dq
+
+# Complex filter with precedence
+# Nm zfs Cm list Fl x Ar \(dq(guid > 1000 && used < 1M) || name == temp\(dq
+.Ed
 .El
 .
 .Sh EXAMPLES
