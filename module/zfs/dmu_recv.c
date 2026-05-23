@@ -98,6 +98,7 @@ struct receive_record_arg {
 	abd_t *abd;
 	int payload_size;
 	uint64_t bytes_read; /* bytes read from stream when record created */
+	uint64_t header_offset; /* byte position of this record's header */
 	boolean_t eos_marker; /* Marks the end of the stream */
 	bqueue_node_t node;
 };
@@ -126,6 +127,7 @@ struct receive_writer_arg {
 	uint64_t last_offset;
 	uint64_t max_object; /* highest object ID referenced in stream */
 	uint64_t bytes_read; /* bytes read when current record created */
+	uint64_t stream_offset; /* header byte offset of current record */
 
 	list_t write_batch;
 
@@ -949,6 +951,8 @@ dmu_recv_begin_sync(void *arg, dmu_tx_t *tx)
 		    8, 1, &zero, tx));
 		VERIFY0(zap_add(mos, dsobj, DS_FIELD_RESUME_BYTES,
 		    8, 1, &zero, tx));
+		VERIFY0(zap_add(mos, dsobj, DS_FIELD_RESUME_STREAM_OFFSET,
+		    8, 1, &zero, tx));
 		if (featureflags & DMU_BACKUP_FEATURE_LARGE_BLOCKS) {
 			VERIFY0(zap_add(mos, dsobj, DS_FIELD_RESUME_LARGEBLOCK,
 			    8, 1, &one, tx));
@@ -1668,6 +1672,8 @@ save_resume_state(struct receive_writer_arg *rwa,
 	rwa->os->os_dsl_dataset->ds_resume_object[txgoff] = object;
 	rwa->os->os_dsl_dataset->ds_resume_offset[txgoff] = offset;
 	rwa->os->os_dsl_dataset->ds_resume_bytes[txgoff] = rwa->bytes_read;
+	rwa->os->os_dsl_dataset->ds_resume_stream_offset[txgoff] =
+	    rwa->stream_offset;
 }
 
 static int
@@ -2383,6 +2389,7 @@ flush_write_batch_impl(struct receive_writer_arg *rwa)
 		 * received (as opposed to the next record), so that we can
 		 * verify that we are resuming from the correct location.
 		 */
+		rwa->stream_offset = rrd->header_offset;
 		save_resume_state(rwa, drrw->drr_object, drrw->drr_offset, tx);
 
 		list_remove(&rwa->write_batch, rrd);
@@ -2805,6 +2812,8 @@ receive_read_payload_and_next_header(dmu_recv_cookie_t *drc, int len, void *buf)
 
 		/* note: rrd is NULL when reading the begin record's payload */
 		if (drc->drc_rrd != NULL) {
+			drc->drc_rrd->header_offset =
+			    drc->drc_rrd->bytes_read;
 			drc->drc_rrd->payload = buf;
 			drc->drc_rrd->payload_size = len;
 			drc->drc_rrd->bytes_read = drc->drc_bytes_read;
@@ -3129,6 +3138,7 @@ receive_process_record(struct receive_writer_arg *rwa,
 	/* Processing in order, therefore bytes_read should be increasing. */
 	ASSERT3U(rrd->bytes_read, >=, rwa->bytes_read);
 	rwa->bytes_read = rrd->bytes_read;
+	rwa->stream_offset = rrd->header_offset;
 
 	/* We can only heal write records; other ones get ignored */
 	if (rwa->heal && rrd->header.drr_type != DRR_WRITE) {
@@ -3759,6 +3769,8 @@ dmu_recv_end_sync(void *arg, dmu_tx_t *tx)
 			    DS_FIELD_RESUME_OFFSET, tx);
 			(void) zap_remove(dp->dp_meta_objset, ds->ds_object,
 			    DS_FIELD_RESUME_BYTES, tx);
+			(void) zap_remove(dp->dp_meta_objset, ds->ds_object,
+			    DS_FIELD_RESUME_STREAM_OFFSET, tx);
 			(void) zap_remove(dp->dp_meta_objset, ds->ds_object,
 			    DS_FIELD_RESUME_TOGUID, tx);
 			(void) zap_remove(dp->dp_meta_objset, ds->ds_object,
