@@ -39,9 +39,8 @@ Contents:
    - [Step 2 - Resume a send from a partial stream file](#user-content-step-2---resume-a-send-from-a-partial-stream-file)
    - [Step 3 - Split a stream into chunks](#user-content-step-3---split-a-stream-into-chunks)
    - [Step 4 - Join chunks back into a single stream](#user-content-step-4---join-chunks-back-into-a-single-stream)
-   - [Step 5 - Chunked upload with resume (end-to-end workflow)](#user-content-step-5---chunked-upload-with-resume-end-to-end-workflow)
+   - [Step 5 - upload zfs naphots to remote file server with resume](#user-content-step-5---upload-zfs-naphots-to-remote-file-server-with-resume)
    - [Step 6 - Distribute a single stream to multiple slave hosts](#user-content-step-6---distribute-a-single-stream-to-multiple-slave-hosts)
-   - [Step 7 - Inspect a stream file without receiving](#user-content-step-7---inspect-a-stream-file-without-receiving)
 
 
 ------------------------------------------------------------------

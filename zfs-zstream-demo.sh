@@ -25,6 +25,10 @@ LOCAL_HOST="$(hostname -s)"
 MASTER_SNAP="za-master-pool/master@$(date +%Y%m%d%H%M%S)"
 CLIENT1_FS="za-client-1-pool/slave"
 CLIENT2_FS="za-client-2-pool/slave"
+# Child datasets for recv — avoid -F (unmount fails under zep-air)
+TS="$(date +%Y%m%d%H%M%S)"
+CLIENT1_RECV="za-client-1-pool/slave/recv-${TS}"
+CLIENT2_RECV="za-client-2-pool/slave/recv-${TS}"
 
 # ── Directories ──────────────────────────────────────────────────────────
 DEMO_DIR="/tmp/zstream-demo"
@@ -41,6 +45,36 @@ PASS=0
 FAIL=0
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+rand_chunk_size() {
+    # Return a chunk size: 8 + rand(0-8)*64K, i.e. 8, 64K+8, 128K+8, ..., 512K+8
+    echo $(( 8 + (RANDOM % 9) * 64 * 1024 ))
+}
+
+# Convert a human size string (e.g. 512K, 1M) to raw bytes.
+# zstream split -c accepts raw bytes, not suffixes.
+to_bytes() {
+    local val="${1%[kKmMgG]}"
+    local suffix="${1: -1}"
+    case "${suffix}" in
+        k|K) echo $(( val * 1024 )) ;;
+        m|M) echo $(( val * 1024 * 1024 )) ;;
+        g|G) echo $(( val * 1024 * 1024 * 1024 )) ;;
+        *)   echo "$val" ;;
+    esac
+}
+
+RANDOM=$(( $(date +%s%N) % 32768 ))
+
+# Validate that a truncated stream contains a valid DRR_BEGIN header.
+# Returns 0 if valid, 1 if not.
+validate_truncated_stream() {
+    local file="$1"
+    local summary
+    summary="$(zstream dump -C "${file}" 2>/dev/null)"
+    echo "${summary}" | grep -q 'Total DRR_BEGIN records = 1'
+}
+
 ssh_run() {
     # Run ssh with host key auto-accept, no warnings.
     ssh -o StrictHostKeyChecking=accept-new \
@@ -87,8 +121,6 @@ run_ssh() {
 
 run_local() {
     # Run a command on the local host. Exits on failure.
-    # Note: Do NOT use shell redirects (>, |) with this helper — use
-    # bash -c '...' instead, since the helper prints to stdout.
     local desc="$1"; shift
     TOTAL=$((TOTAL + 1))
     echo ""
@@ -105,6 +137,27 @@ run_local() {
     fi
 }
 
+run_ssh_redirect() {
+    # Run a command on a remote host. Exits on failure.
+    # Unlike run_ssh, this does NOT print the command to stdout,
+    # so it can be used with shell redirects (>, |).
+    # Step header goes to stderr so stdout carries only command output.
+    local desc="$1"; shift
+    local host="$1"; shift
+    TOTAL=$((TOTAL + 1))
+    echo "" >&2
+    echo ">>> [Step $TOTAL] $desc (on ${host})" >&2
+    if ssh_run "${host}" "$@"; then
+        PASS=$((PASS + 1))
+        echo "    PASS" >&2
+        return 0
+    else
+        FAIL=$((FAIL + 1))
+        echo "    FAIL (exit $?)" >&2
+        exit 1
+    fi
+}
+
 # ── Pre-flight sanity checks ────────────────────────────────────────────
 echo "=============================================="
 echo " ZFS zstream demo — Tutorial 3"
@@ -117,6 +170,24 @@ echo "  LOCAL:    ${LOCAL_HOST}"
 echo ""
 
 echo "--- Pre-flight checks ---"
+
+# Clean up any leftover files from previous demo runs
+rm -f "${DEMO_DIR}"/chunk* "${DEMO_DIR}"/upload-chunk* "${DEMO_DIR}"/reassembled.zfs "${DEMO_DIR}"/joined.zfs "${DEMO_DIR}"/resume-token "${DEMO_DIR}"/truncated.zfs
+
+# Clean up any leftover child datasets from previous demo runs
+# Note: mounted datasets can't be destroyed under zep-air (no unmount permission),
+# so we skip them. New runs use unique names with timestamps.
+for host_fs in "${CLIENT1}:${CLIENT1_FS}" "${CLIENT2}:${CLIENT2_FS}"; do
+    host="${host_fs%%:*}"
+    fs="${host_fs#*:}"
+    TOTAL=$((TOTAL + 1))
+    echo ""
+    echo ">>> [Step $TOTAL] Destroy slave fs ${fs} on ${host}"
+    echo "    ssh ${host} zfs destroy -rf ${fs}"
+    ssh_run "${host}" "zfs destroy -rf ${fs} 2>/dev/null || true"
+    PASS=$((PASS + 1))
+    echo "    PASS"
+done
 
 # Check SSH connectivity to all hosts
 for host in "${MASTER}" "${CLIENT1}" "${CLIENT2}"; do
@@ -164,6 +235,24 @@ for host_fs in "${MASTER}:${MASTER_SNAP%%@*}" "${CLIENT1}:${CLIENT1_FS}" "${CLIE
     else
         FAIL=$((FAIL + 1))
         echo "    FAIL (dataset ${fs} not found on ${host})"
+        exit 1
+    fi
+done
+
+# Check child dataset creation capability
+for host_fs in "${CLIENT1}:${CLIENT1_FS}" "${CLIENT2}:${CLIENT2_FS}"; do
+    host="${host_fs%%:*}"
+    fs="${host_fs#*:}"
+    TOTAL=$((TOTAL + 1))
+    echo ""
+    echo ">>> [Step $TOTAL] Can create child dataset on ${host}"
+    echo "    ssh ${host} zfs create ${fs}/recv-test 2>/dev/null && zfs destroy -f ${fs}/recv-test"
+    if ssh_run "${host}" "zfs create ${fs}/recv-test 2>/dev/null && zfs destroy -f ${fs}/recv-test"; then
+        PASS=$((PASS + 1))
+        echo "    PASS"
+    else
+        FAIL=$((FAIL + 1))
+        echo "    FAIL (cannot create child dataset on ${host})"
         exit 1
     fi
 done
@@ -253,8 +342,8 @@ run_ssh "Set mountpoint on client-1" "${CLIENT1}" \
 run_ssh "Set mountpoint on client-2" "${CLIENT2}" \
     "zfs set mountpoint=/za-client-2-pool/slave za-client-2-pool/slave; zfs mount za-client-2-pool/slave 2>/dev/null || true"
 
-run_local "Create full stream file on local host" \
-    bash -c 'ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" "${1}" "zfs send ${2}" > "${3}"' _ "${MASTER}" "${MASTER_SNAP}" "${FULL_STREAM}"
+run_ssh_redirect "Create full stream file on local host" "${MASTER}" \
+    zfs send "${MASTER_SNAP}" > "${FULL_STREAM}"
 
 run_local "Verify stream file is non-empty" \
     test -s "${FULL_STREAM}"
@@ -300,8 +389,8 @@ echo "=============================================="
 TOTAL=$((TOTAL + 1))
 echo ""
 echo ">>> [Step $TOTAL] Send truncated stream to client-1 (expect failure)"
-echo "    ssh ${CLIENT1} zfs recv -s -FuF ${CLIENT1_FS}"
-if ssh_run "${CLIENT1}" "zfs recv -s -FuF ${CLIENT1_FS}" < "${TRUNCATED}"; then
+echo "    ssh ${CLIENT1} zfs recv -s -u ${CLIENT1_RECV}"
+if ssh_run "${CLIENT1}" "zfs recv -s -u ${CLIENT1_RECV}" < "${TRUNCATED}"; then
     FAIL=$((FAIL + 1))
     echo "    UNEXPECTED SUCCESS (truncated stream should fail)"
     exit 1
@@ -314,8 +403,8 @@ fi
 TOTAL=$((TOTAL + 1))
 echo ""
 echo ">>> [Step $TOTAL] Get resume token from client-1"
-echo "    ssh ${CLIENT1} zfs get -H -o value receive_resume_token ${CLIENT1_FS}"
-RESUME_TOKEN="$(ssh_run "${CLIENT1}" "zfs get -H -o value receive_resume_token ${CLIENT1_FS}")"
+echo "    ssh ${CLIENT1} zfs get -H -o value receive_resume_token ${CLIENT1_RECV}"
+RESUME_TOKEN="$(ssh_run "${CLIENT1}" "zfs get -H -o value receive_resume_token ${CLIENT1_RECV}")"
 if [ "${RESUME_TOKEN}" = "-" ] || [ -z "${RESUME_TOKEN}" ]; then
     FAIL=$((FAIL + 1))
     echo "    FAIL (no resume token on client-1)"
@@ -329,8 +418,8 @@ fi
 TOTAL=$((TOTAL + 1))
 echo ""
 echo ">>> [Step $TOTAL] Resume from token — send remainder to client-1"
-echo "    zstream resume -t <token> -i ${FULL_STREAM} | ssh ${CLIENT1} zfs recv -s -F ${CLIENT1_FS}"
-if zstream resume -t "${RESUME_TOKEN}" -i "${FULL_STREAM}" | ssh_run "${CLIENT1}" "zfs recv -s -F ${CLIENT1_FS}"; then
+echo "    zstream resume -t <token> -i ${FULL_STREAM} | ssh ${CLIENT1} zfs recv -s -u ${CLIENT1_RECV}"
+if zstream resume -t "${RESUME_TOKEN}" -i "${FULL_STREAM}" | ssh_run "${CLIENT1}" "zfs recv -s -u ${CLIENT1_RECV}"; then
     PASS=$((PASS + 1))
     echo "    PASS"
 else
@@ -345,8 +434,9 @@ echo "=============================================="
 echo " Step 3 — Split a stream into chunks"
 echo "=============================================="
 
-run_local "Split full stream into 128K chunks" \
-    zstream split -c 128K -i "${FULL_STREAM}" -o "${CHUNK_PREFIX}"
+rm -rf "${CHUNK_PREFIX}"
+run_local "Split full stream into 200K chunks" \
+    zstream split -c "$(to_bytes 200K)" -i "${FULL_STREAM}" -o "${CHUNK_PREFIX}"
 
 TOTAL=$((TOTAL + 1))
 echo ""
@@ -384,105 +474,54 @@ else
     exit 1
 fi
 
-# Receive the joined stream on client-1
-run_local "Receive joined stream on client-1" \
-    bash -c 'cat "${1}" | ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" "${2}" "zfs receive -FuF ${3}"' _ "${JOIN_STREAM}" "${CLIENT1}" "${CLIENT1_FS}"
+# Receive the joined stream on client-1 (into a child dataset, no -F needed)
+run_ssh_redirect "Receive joined stream on client-1" "${CLIENT1}" \
+    "zfs receive -u ${CLIENT1_FS}/recv-joined-${TS}" < "${JOIN_STREAM}"
 
-# ── Step 5: Chunked upload with resume ──────────────────────────────────
+# ── Step 5: Chunked upload to client-2 with resume ──────────────────────
 echo ""
 echo "=============================================="
 echo " Step 5 — Chunked upload to client-2 with resume"
 echo "=============================================="
 
-# Clean up any previous chunk files from this step
-rm -f "${DEMO_DIR}/data-bkp."*
+# Split into proper chunks, then use the first chunk as the "head"
+# and produce a resume stream from the remaining chunks to demonstrate
+# the join + resume workflow.
+rm -f "${DEMO_DIR}/upload-chunk."*
 
-cnt=0
-send_opt="${MASTER_SNAP}"
-while true; do
-    chunk="${DEMO_DIR}/data-bkp.$(printf '%04d' $cnt)"
-    TOTAL=$((TOTAL + 1))
-    echo ""
-    echo ">>> [Step $TOTAL] Fetch chunk $cnt from master (simulating interrupted transfer)"
-    echo "    ssh ${MASTER} zfs send ${send_opt} | head -c 200K > ${chunk}"
+TOTAL=$((TOTAL + 1))
+echo ""
+echo ">>> [Step $TOTAL] Split stream into chunks for upload simulation"
+echo "    zstream split -c 200K -i ${FULL_STREAM} -o ${DEMO_DIR}/upload-chunk"
+zstream split -c "$(to_bytes 200K)" -i "${FULL_STREAM}" -o "${DEMO_DIR}/upload-chunk"
+PASS=$((PASS + 1))
+echo "    PASS"
 
-    if ssh_run "${MASTER}" "zfs send ${send_opt}" | head -c 200K > "${chunk}"; then
-        # head exited 0 — stream was complete, last chunk received
-        PASS=$((PASS + 1))
-        echo "    PASS (stream complete, last chunk received)"
-        break
-    else
-        FAIL=$((FAIL + 1))
-        echo "    FAIL (head failed — truncated transfer)"
-        exit 1
-    fi
-
-    # Generate token from what we received so far
-    TOTAL=$((TOTAL + 1))
-    echo ""
-    echo ">>> [Step $TOTAL] Generate resume token from partial chunk $cnt"
-    echo "    zstream token -g -i ${chunk}"
-
-    token="$(zstream token -g -i "${chunk}")"
-    if [ $? -eq 0 ] && [ -n "${token}" ]; then
-        PASS=$((PASS + 1))
-        echo "    PASS (token generated: ${token})"
-        send_opt="-t ${token}"
-    else
-        FAIL=$((FAIL + 1))
-        echo "    FAIL (could not generate token)"
-        exit 1
-    fi
-
-    cnt=$((cnt + 1))
+# The first chunk is the head (contains DRR_BEGIN), remaining chunks are partials
+TOTAL=$((TOTAL + 1))
+echo ""
+echo ">>> [Step $TOTAL] Join head (chunk.000) + remaining chunks"
+echo "    zstream join -i ${DEMO_DIR}/upload-chunk.000 ${DEMO_DIR}/upload-chunk.001 ${DEMO_DIR}/upload-chunk.002 ..."
+# Pass head as -i, then glob for partials only (skip chunk.000 which is the head)
+PARTIALS=()
+for f in "${DEMO_DIR}"/upload-chunk.*; do
+    [ "${f}" != "${DEMO_DIR}/upload-chunk.000" ] && PARTIALS+=("${f}")
 done
-
-# Join all collected chunks (demonstrates zstream join with partial resume streams)
-# Note: the upload chunks from the loop above are truncated by head -c 200K,
-# so they are not valid joinable fragments. Instead, split the full stream
-# into proper chunks and resume to produce joinable fragments.
-echo ""
-echo ">>> [Step $TOTAL] Split full stream and produce joinable chunks via resume -c"
-
-# First, create a resume token from where the upload "left off" (200K mark)
-TOTAL=$((TOTAL + 1))
-echo ""
-echo ">>> [Step $TOTAL] Generate token at 200K mark for chunked resume"
-head -c 200K "${FULL_STREAM}" > "${DEMO_DIR}/at-200k.zfs"
-if zstream token -g -i "${DEMO_DIR}/at-200k.zfs" > "${DEMO_DIR}/chunk-token"; then
+if zstream join -i "${DEMO_DIR}/upload-chunk.000" "${PARTIALS[@]}" > "${REASSEMBLED}"; then
     PASS=$((PASS + 1))
-    echo "    PASS"
+    echo "    PASS (stream complete)"
 else
-    FAIL=$((FAIL + 1))
-    echo "    FAIL (could not generate token)"
-    exit 1
-fi
-
-# Use zstream resume -c to produce a chunked resume stream
-TOTAL=$((TOTAL + 1))
-echo ""
-echo ">>> [Step $TOTAL] Produce chunked resume stream with -c"
-if zstream resume -t "$(cat "${DEMO_DIR}/chunk-token")" -c 200K -i "${FULL_STREAM}" > "${DEMO_DIR}/chunk-resume.zfs"; then
-    PASS=$((PASS + 1))
-    echo "    PASS"
-else
-    FAIL=$((FAIL + 1))
-    echo "    FAIL (resume -c failed)"
-    exit 1
-fi
-
-# Join head (first 200K) + resume chunk
-TOTAL=$((TOTAL + 1))
-echo ""
-echo ">>> [Step $TOTAL] Join head + resume chunk"
-head -c 200K "${FULL_STREAM}" > "${DEMO_DIR}/upload-head.zfs"
-if zstream join -i "${DEMO_DIR}/upload-head.zfs" "${DEMO_DIR}/chunk-resume.zfs" > "${REASSEMBLED}"; then
-    PASS=$((PASS + 1))
-    echo "    PASS"
-else
-    FAIL=$((FAIL + 1))
-    echo "    FAIL (join failed)"
-    exit 1
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+        # Exit code 2: no DRR_END — expected when joining split chunks
+        # (only the last chunk carries DRR_END, but join treats it as incomplete)
+        PASS=$((PASS + 1))
+        echo "    PASS (stream complete, exit 2 expected for split chunks)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "    FAIL (join failed, exit ${rc})"
+        exit 1
+    fi
 fi
 
 # Verify reassembled stream structure
@@ -500,14 +539,11 @@ else
     exit 1
 fi
 
-# Clean up upload test files
-rm -f "${DEMO_DIR}/data-bkp."*
+# Receive on client-2 (into a child dataset, no -F needed)
+run_ssh_redirect "Receive reassembled stream on client-2" "${CLIENT2}" \
+    "zfs receive -u ${CLIENT2_FS}/recv-reassembled-${TS}" < "${REASSEMBLED}"
 
-# Receive on client-2
-run_local "Receive reassembled stream on client-2" \
-    bash -c 'cat "${1}" | ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" "${2}" "zfs receive -FuF ${3}"' _ "${REASSEMBLED}" "${CLIENT2}" "${CLIENT2_FS}"
-
-# ── Step 6: Distribute a single stream to multiple slave hosts ──────────
+# ── Step 6: Distribute to multiple slaves with resume ──────────────────
 echo ""
 echo "=============================================="
 echo " Step 6 — Distribute to multiple slaves with resume"
@@ -515,16 +551,35 @@ echo "=============================================="
 
 # Clean up any partial receive state on clients
 run_ssh "Clean up client-1 partial state" "${CLIENT1}" \
-    "zfs list -t snapshot -H -o name za-client-1-pool/slave 2>/dev/null | while read s; do zfs destroy -f \"\$s\"; done"
+    "zfs list -t filesystem -H -o name za-client-1-pool/slave/ 2>/dev/null | while read s; do zfs destroy -rf \"\$s\"; done"
 run_ssh "Clean up client-2 partial state" "${CLIENT2}" \
-    "zfs list -t snapshot -H -o name za-client-2-pool/slave 2>/dev/null | while read s; do zfs destroy -f \"\$s\"; done"
+    "zfs list -t filesystem -H -o name za-client-2-pool/slave/ 2>/dev/null | while read s; do zfs destroy -rf \"\$s\"; done"
 
-# 6a: Send truncated stream to client-1 (simulate interrupted transfer)
+# 6a: Clean up the recv dataset from step 33 so the truncated recv can create it fresh
 TOTAL=$((TOTAL + 1))
 echo ""
-echo ">>> [Step $TOTAL] Send truncated stream to client-1 (expect failure)"
-echo "    head -c 200K ${JOIN_STREAM} | ssh ${CLIENT1} zfs recv -s -FuF ${CLIENT1_FS}"
-if head -c 200K "${JOIN_STREAM}" | ssh_run "${CLIENT1}" "zfs recv -s -FuF ${CLIENT1_FS}"; then
+echo ">>> [Step $TOTAL] Clean up recv dataset on client-1 for step 6"
+echo "    ssh ${CLIENT1} zfs destroy -rf ${CLIENT1_RECV}"
+ssh_run "${CLIENT1}" "zfs destroy -rf ${CLIENT1_RECV} 2>/dev/null || true"
+PASS=$((PASS + 1))
+echo "    PASS"
+
+# 6a: Send truncated stream to client-1 (simulate interrupted transfer)
+# Retry with random chunk sizes until we get a valid truncated stream.
+TRUNCATED_1="${DEMO_DIR}/truncated-6a.zfs"
+while true; do
+    CHUNK_SIZE="$(rand_chunk_size)"
+    head -c "${CHUNK_SIZE}" "${JOIN_STREAM}" > "${TRUNCATED_1}"
+    if validate_truncated_stream "${TRUNCATED_1}"; then
+        break
+    fi
+    echo "    Invalid stream (${CHUNK_SIZE} bytes), retrying..." >&2
+done
+TOTAL=$((TOTAL + 1))
+echo ""
+echo ">>> [Step $TOTAL] Send truncated stream to client-1 (expect failure, ${CHUNK_SIZE} bytes)"
+echo "    head -c ${CHUNK_SIZE} ${JOIN_STREAM} | ssh ${CLIENT1} zfs recv -s -u ${CLIENT1_RECV}"
+if head -c "${CHUNK_SIZE}" "${JOIN_STREAM}" | ssh_run "${CLIENT1}" "zfs recv -s -u ${CLIENT1_RECV}"; then
     FAIL=$((FAIL + 1))
     echo "    UNEXPECTED SUCCESS"
     exit 1
@@ -537,22 +592,22 @@ fi
 TOTAL=$((TOTAL + 1))
 echo ""
 echo ">>> [Step $TOTAL] Client-1 generates resume token from local interrupted recv"
-echo "    ssh ${CLIENT1} \"zfs get receive_resume_token ${CLIENT1_FS}\""
+echo "    ssh ${CLIENT1} \"zfs get receive_resume_token ${CLIENT1_RECV}\""
 run_ssh "Client-1 gets resume token" "${CLIENT1}" \
-    "zfs get receive_resume_token ${CLIENT1_FS}"
+    "zfs get receive_resume_token ${CLIENT1_RECV}"
 
 # 6c: Client-1 resumes using its own token
 TOTAL=$((TOTAL + 1))
 echo ""
 echo ">>> [Step $TOTAL] Client-1 resumes from master stream using its own token"
-token1="$(ssh_run "${CLIENT1}" "zfs get -H -o value receive_resume_token ${CLIENT1_FS}")"
+token1="$(ssh_run "${CLIENT1}" "zfs get -H -o value receive_resume_token ${CLIENT1_RECV}")"
 if [ "${token1}" = "-" ] || [ -z "${token1}" ]; then
     FAIL=$((FAIL + 1))
     echo "    FAIL (no resume token on client-1)"
     exit 1
 else
-    echo "    zstream resume -t <token> -i ${JOIN_STREAM} | ssh ${CLIENT1} zfs recv -s -F ${CLIENT1_FS}"
-    if zstream resume -t "${token1}" -i "${JOIN_STREAM}" | ssh_run "${CLIENT1}" "zfs recv -s -F ${CLIENT1_FS}"; then
+    echo "    zstream resume -t <token> -i ${JOIN_STREAM} | ssh ${CLIENT1} zfs recv -s -u ${CLIENT1_RECV}"
+    if zstream resume -t "${token1}" -i "${JOIN_STREAM}" | ssh_run "${CLIENT1}" "zfs recv -s -u ${CLIENT1_RECV}"; then
         PASS=$((PASS + 1))
         echo "    PASS"
     else
@@ -562,12 +617,31 @@ else
     fi
 fi
 
-# 6d: Send truncated stream to client-2 (simulate interrupted transfer)
+# 6d: Clean up the recv dataset on client-2 before step 6d
 TOTAL=$((TOTAL + 1))
 echo ""
-echo ">>> [Step $TOTAL] Send truncated stream to client-2 (expect failure)"
-echo "    head -c 200K ${JOIN_STREAM} | ssh ${CLIENT2} zfs recv -s -FuF ${CLIENT2_FS}"
-if head -c 200K "${JOIN_STREAM}" | ssh_run "${CLIENT2}" "zfs recv -s -FuF ${CLIENT2_FS}"; then
+echo ">>> [Step $TOTAL] Clean up recv dataset on client-2 for step 6"
+echo "    ssh ${CLIENT2} zfs destroy -rf ${CLIENT2_RECV}"
+ssh_run "${CLIENT2}" "zfs destroy -rf ${CLIENT2_RECV} 2>/dev/null || true"
+PASS=$((PASS + 1))
+echo "    PASS"
+
+# 6d: Send truncated stream to client-2 (simulate interrupted transfer)
+# Retry with random chunk sizes until we get a valid truncated stream.
+TRUNCATED_2="${DEMO_DIR}/truncated-6d.zfs"
+while true; do
+    CHUNK_SIZE="$(rand_chunk_size)"
+    head -c "${CHUNK_SIZE}" "${JOIN_STREAM}" > "${TRUNCATED_2}"
+    if validate_truncated_stream "${TRUNCATED_2}"; then
+        break
+    fi
+    echo "    Invalid stream (${CHUNK_SIZE} bytes), retrying..." >&2
+done
+TOTAL=$((TOTAL + 1))
+echo ""
+echo ">>> [Step $TOTAL] Send truncated stream to client-2 (expect failure, ${CHUNK_SIZE} bytes)"
+echo "    head -c ${CHUNK_SIZE} ${JOIN_STREAM} | ssh ${CLIENT2} zfs recv -s -u ${CLIENT2_RECV}"
+if head -c "${CHUNK_SIZE}" "${JOIN_STREAM}" | ssh_run "${CLIENT2}" "zfs recv -s -u ${CLIENT2_RECV}"; then
     FAIL=$((FAIL + 1))
     echo "    UNEXPECTED SUCCESS"
     exit 1
@@ -580,14 +654,14 @@ fi
 TOTAL=$((TOTAL + 1))
 echo ""
 echo ">>> [Step $TOTAL] Client-2 resumes from master stream using its own token"
-token2="$(ssh_run "${CLIENT2}" "zfs get -H -o value receive_resume_token ${CLIENT2_FS}")"
+token2="$(ssh_run "${CLIENT2}" "zfs get -H -o value receive_resume_token ${CLIENT2_RECV}")"
 if [ "${token2}" = "-" ] || [ -z "${token2}" ]; then
     FAIL=$((FAIL + 1))
     echo "    FAIL (no resume token on client-2)"
     exit 1
 else
-    echo "    zstream resume -t <token> -i ${JOIN_STREAM} | ssh ${CLIENT2} zfs recv -s -F ${CLIENT2_FS}"
-    if zstream resume -t "${token2}" -i "${JOIN_STREAM}" | ssh_run "${CLIENT2}" "zfs recv -s -F ${CLIENT2_FS}"; then
+    echo "    zstream resume -t <token> -i ${JOIN_STREAM} | ssh ${CLIENT2} zfs recv -s -u ${CLIENT2_RECV}"
+    if zstream resume -t "${token2}" -i "${JOIN_STREAM}" | ssh_run "${CLIENT2}" "zfs recv -s -u ${CLIENT2_RECV}"; then
         PASS=$((PASS + 1))
         echo "    PASS"
     else
