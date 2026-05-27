@@ -10,17 +10,21 @@ zstream_SOURCES = \
 	%D%/zstream_decompress.c \
 	%D%/zstream_drop_record.c \
 	%D%/zstream_dump.c \
+	%D%/zstream_join.c \
 	%D%/zstream_recompress.c \
 	%D%/zstream_redup.c \
 	%D%/zstream_token.c \
+	%D%/zstream_resume.c \
+	%D%/zstream_split.c \
 	%D%/zstream_util.c \
 	%D%/zstream_util.h
 
 zstream_LDADD = \
+	libzpool.la \
 	libzfs.la \
 	libzfs_core.la \
-	libzpool.la \
-	libnvpair.la
+	libnvpair.la \
+	-lz
 
 cmd-zstream-install-exec-hook:
 	cd $(DESTDIR)$(sbindir) && $(LN_S) -f zstream zstreamdump

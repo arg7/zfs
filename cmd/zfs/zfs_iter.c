@@ -66,6 +66,8 @@ struct callback_data {
 	int			cb_depth_limit;
 	int			cb_depth;
 	uint8_t			cb_props_table[ZFS_NUM_PROPS];
+	void			*cb_filter;
+	int			(*cb_filter_fn)(zfs_handle_t *, void *);
 };
 
 /*
@@ -104,22 +106,34 @@ zfs_callback(zfs_handle_t *zhp, void *data)
 		node->zn_handle = zhp;
 		node->zn_callback = cb;
 		if (avl_find(&cb->cb_avl, node, &idx) == NULL) {
-			if (cb->cb_proplist) {
-				if ((*cb->cb_proplist) &&
-				    !(*cb->cb_proplist)->pl_all)
-					zfs_prune_proplist(zhp,
-					    cb->cb_props_table);
+			if (cb->cb_filter_fn != NULL &&
+			    cb->cb_filter_fn(zhp, cb->cb_filter) == 0) {
+				/*
+				 * Filter rejected this dataset; skip AVL
+				 * insertion but continue to recurse.
+				 */
+				free(node);
+			} else {
+				if (cb->cb_proplist) {
+					if ((*cb->cb_proplist) &&
+					    !(*cb->cb_proplist)->pl_all)
+						zfs_prune_proplist(zhp,
+						    cb->cb_props_table);
 
-				if (zfs_expand_proplist(zhp, cb->cb_proplist,
-				    (cb->cb_flags & ZFS_ITER_RECVD_PROPS),
-				    (cb->cb_flags & ZFS_ITER_LITERAL_PROPS))
-				    != 0) {
-					free(node);
-					return (-1);
+					if (zfs_expand_proplist(zhp,
+					    cb->cb_proplist,
+					    (cb->cb_flags &
+					    ZFS_ITER_RECVD_PROPS),
+					    (cb->cb_flags &
+					    ZFS_ITER_LITERAL_PROPS))
+					    != 0) {
+						free(node);
+						return (-1);
+					}
 				}
+				avl_insert(&cb->cb_avl, node, idx);
+				should_close = B_FALSE;
 			}
-			avl_insert(&cb->cb_avl, node, idx);
-			should_close = B_FALSE;
 		} else {
 			free(node);
 		}
@@ -429,7 +443,8 @@ zfs_sort(const void *larg, const void *rarg)
 int
 zfs_for_each(int argc, char **argv, int flags, zfs_type_t types,
     zfs_sort_column_t *sortcol, zprop_list_t **proplist, int limit,
-    zfs_iter_f callback, void *data)
+    zfs_iter_f callback, void *data, void *filter,
+    int (*filter_fn)(zfs_handle_t *, void *))
 {
 	callback_data_t cb = {0};
 	int ret = 0;
@@ -440,6 +455,8 @@ zfs_for_each(int argc, char **argv, int flags, zfs_type_t types,
 	cb.cb_proplist = proplist;
 	cb.cb_types = types;
 	cb.cb_depth_limit = limit;
+	cb.cb_filter = filter;
+	cb.cb_filter_fn = filter_fn;
 	/*
 	 * If cb_proplist is provided then in the zfs_handles created we
 	 * retain only those properties listed in cb_proplist and sortcol.

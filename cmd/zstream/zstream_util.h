@@ -53,6 +53,25 @@ extern int
 dump_record(dmu_replay_record_t *drr, void *payload, size_t payload_len,
 	zio_cksum_t *zc, int outfd);
 
+extern uint64_t
+token_stream_offset(const char *token);
+
+extern uint64_t
+parse_size_suffix(const char *str);
+
+extern uint64_t
+record_payload_size(dmu_replay_record_t *drr);
+
+/*
+ * Copy records from infp to outfd, recomputing checksums into zc.
+ * If skip_begin is set, the first record (DRR_BEGIN + payload) is
+ * skipped.
+ *
+ * Returns: 1 if DRR_END was seen, 0 on EOF, -1 on error.
+ */
+extern int
+stream_copy_records(FILE *infp, int outfd, zio_cksum_t *zc, int skip_begin);
+
 #ifdef __cplusplus
 }
 #endif
