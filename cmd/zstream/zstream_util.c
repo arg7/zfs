@@ -261,3 +261,55 @@ stream_copy_records(FILE *infp, int outfd, zio_cksum_t *zc, int skip_begin)
 			return (-1);
 	}
 }
+
+/*
+ * Validate that a stream file has a clean tail (no partial records at EOF).
+ * Reads all records, accumulates checksum into zc, but writes nothing.
+ * A "dirty" tail means EOF occurred mid-record-payload (file truncated
+ * within a WRITE/OBJECT/SPILL record), producing unrecoverable garbage.
+ *
+ * Returns: 1 if DRR_END was seen (stream complete),
+ *          0 on clean EOF at a record boundary (no DRR_END),
+ *          -1 on error,
+ *          -2 on dirty tail (EOF mid-record payload).
+ */
+int
+stream_validate_tail(FILE *infp, zio_cksum_t *zc)
+{
+	dmu_replay_record_t drr;
+
+	for (;;) {
+		int nread = sfread(&drr, sizeof (drr), infp);
+		if (nread == 0)
+			return (0);
+
+		uint64_t psize = record_payload_size(&drr);
+		void *buf = NULL;
+		if (psize > 0) {
+			buf = safe_malloc(psize);
+			if (fread(buf, psize, 1, infp) != 1) {
+				free(buf);
+				if (feof(infp))
+					return (-2);
+				return (-1);
+			}
+		}
+
+		if (drr.drr_type == DRR_END) {
+			free(buf);
+			return (1);
+		}
+
+		fletcher_4_incremental_native(&drr,
+		    offsetof(dmu_replay_record_t,
+		    drr_u.drr_checksum.drr_checksum), zc);
+		fletcher_4_incremental_native(
+		    &drr.drr_u.drr_checksum.drr_checksum,
+		    sizeof (zio_cksum_t), zc);
+
+		if (psize > 0) {
+			fletcher_4_incremental_native(buf, psize, zc);
+			free(buf);
+		}
+	}
+}

@@ -25,6 +25,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,10 +40,16 @@ static void
 join_usage(void)
 {
 	(void) fprintf(stderr,
-	    "usage: zstream join [-i head] partial1 [partial2 ...]\n"
+	    "usage: zstream join [-i head] [-m] partial1 [partial2 ...]\n"
 	    "\n"
 	    "Join a send stream head fragment with one or more partial\n"
 	    "resume streams into a single output stream.\n"
+	    "\n"
+	    "Options:\n"
+	    "  -i head    head fragment (required unless first positional arg)\n"
+	    "  -m         merge partials in-place into the head file\n"
+	    "             (head must have a clean tail, i.e. no mid-record\n"
+	    "             truncation; incompatible with -i)\n"
 	    "\n"
 	    "Exit codes:\n"
 	    "  0  stream is complete (DRR_END written)\n"
@@ -51,15 +58,16 @@ join_usage(void)
 	    "\n"
 	    "Example:\n"
 	    "  zstream join -i head.zfs resume1.zfs resume2.zfs \\\n"
-	    "      > full_stream.zfs\n");
+	    "      > full_stream.zfs\n"
+	    "  zstream join --merge 0000.zfs 0001.zfs 0002.zfs\n");
 	exit(1);
 }
 
 /*
- * Write a fresh DRR_END record with the final checksum zc.
+ * Write a fresh DRR_END record with the final checksum zc to outfd.
  */
 static int
-write_end_record(zio_cksum_t *zc)
+write_end_record(zio_cksum_t *zc, int outfd)
 {
 	dmu_replay_record_t drr;
 	bzero(&drr, sizeof (drr));
@@ -68,19 +76,26 @@ write_end_record(zio_cksum_t *zc)
 	bzero(&drr.drr_u.drr_checksum.drr_checksum,
 	    sizeof (zio_cksum_t));
 
-	return (dump_record(&drr, NULL, 0, zc, STDOUT_FILENO));
+	return (dump_record(&drr, NULL, 0, zc, outfd));
 }
+
+/* Forward declaration for merge path */
+static int zstream_do_join_merge(int argc, char *argv[]);
 
 int
 zstream_do_join(int argc, char *argv[])
 {
 	char *headfile = NULL;
+	int merge = 0;
 	int c;
 
-	while ((c = getopt(argc, argv, "i:h")) != -1) {
+	while ((c = getopt(argc, argv, "i:mh")) != -1) {
 		switch (c) {
 		case 'i':
 			headfile = optarg;
+			break;
+		case 'm':
+			merge = 1;
 			break;
 		default:
 			join_usage();
@@ -89,6 +104,20 @@ zstream_do_join(int argc, char *argv[])
 
 	argc -= optind;
 	argv += optind;
+
+	if (merge) {
+		if (headfile != NULL) {
+			(void) fprintf(stderr,
+			    "Error: -i and -m are mutually exclusive\n");
+			return (1);
+		}
+		if (argc < 1) {
+			(void) fprintf(stderr,
+			    "Error: --merge requires a head file\n");
+			return (1);
+		}
+		return (zstream_do_join_merge(argc, argv));
+	}
 
 	fletcher_4_init();
 
@@ -156,7 +185,7 @@ zstream_do_join(int argc, char *argv[])
 	if (headfile != NULL)
 		fclose(headfp);
 	if (ret == 1) {
-		if (write_end_record(&zc) != 0) {
+		if (write_end_record(&zc, STDOUT_FILENO) != 0) {
 			(void) fprintf(stderr,
 			    "Error: failed to write DRR_END\n");
 			return (1);
@@ -190,11 +219,131 @@ zstream_do_join(int argc, char *argv[])
 	}
 
 	if (seen_end) {
-		if (write_end_record(&zc) != 0) {
+		if (write_end_record(&zc, STDOUT_FILENO) != 0) {
 			(void) fprintf(stderr,
 			    "Error: failed to write DRR_END\n");
 			return (1);
 		}
+		return (0);
+	}
+
+	(void) fprintf(stderr,
+	    "Warning: no DRR_END in fragments, stream is incomplete\n");
+	return (2);
+}
+
+/*
+ * In-place merge: append partials into the head file.
+ * The head file is validated for a clean tail first.
+ */
+static int
+zstream_do_join_merge(int argc, char *argv[])
+{
+	char *headfile = argv[0];
+
+	argc--;
+	argv++;
+
+	fletcher_4_init();
+
+	/* Phase 1: validate head tail and accumulate checksum */
+	FILE *headfp = fopen(headfile, "rb");
+	if (headfp == NULL) {
+		(void) fprintf(stderr,
+		    "Error: cannot open head %s: %s\n",
+		    headfile, strerror(errno));
+		return (1);
+	}
+
+	zio_cksum_t zc;
+	bzero(&zc, sizeof (zc));
+
+	int ret = stream_validate_tail(headfp, &zc);
+	fclose(headfp);
+
+	switch (ret) {
+	case -2:
+		(void) fprintf(stderr,
+		    "Error: head %s has a dirty tail "
+		    "(truncated mid-record), cannot merge\n", headfile);
+		return (1);
+	case -1:
+		(void) fprintf(stderr,
+		    "Error: failed to validate head %s\n", headfile);
+		return (1);
+	case 1:
+		if (argc == 0) {
+			(void) fprintf(stderr,
+			    "Info: head %s is already complete "
+			    "(DRR_END present), nothing to merge\n",
+			    headfile);
+			return (0);
+		}
+		/*
+		 * Head is complete but partials were given.
+		 * Continue with appending — the tail is clean
+		 * (ends on a record boundary), so we can
+		 * concatenate.
+		 */
+		break;
+	case 0:
+		/* Clean EOF, no DRR_END — proceed with merge. */
+		break;
+	}
+
+	/* Phase 2: open head for appending and merge partials */
+	int head_fd = open(headfile, O_WRONLY | O_APPEND);
+	if (head_fd < 0) {
+		(void) fprintf(stderr,
+		    "Error: cannot open %s for appending: %s\n",
+		    headfile, strerror(errno));
+		return (1);
+	}
+
+	int seen_end = 0;
+
+	for (int i = 0; i < argc; i++) {
+		FILE *pfp = fopen(argv[i], "rb");
+		if (pfp == NULL) {
+			(void) fprintf(stderr,
+			    "Error: cannot open partial %s: %s\n",
+			    argv[i], strerror(errno));
+			close(head_fd);
+			return (1);
+		}
+
+		ret = stream_copy_records(pfp, head_fd, &zc, 1);
+		fclose(pfp);
+
+		if (ret < 0) {
+			(void) fprintf(stderr,
+			    "Error: failed to process partial %s\n",
+			    argv[i]);
+			close(head_fd);
+			return (1);
+		}
+		if (ret == 1)
+			seen_end = 1;
+	}
+
+	close(head_fd);
+
+	if (seen_end) {
+		/* Reopen to write final DRR_END */
+		head_fd = open(headfile, O_WRONLY | O_APPEND);
+		if (head_fd < 0) {
+			(void) fprintf(stderr,
+			    "Error: cannot reopen %s for writing: %s\n",
+			    headfile, strerror(errno));
+			return (1);
+		}
+		if (write_end_record(&zc, head_fd) != 0) {
+			(void) fprintf(stderr,
+			    "Error: failed to write DRR_END\n");
+			close(head_fd);
+			return (1);
+		}
+		close(head_fd);
 		return (0);
 	}
 

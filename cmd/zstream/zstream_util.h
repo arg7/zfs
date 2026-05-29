@@ -72,6 +72,20 @@ record_payload_size(dmu_replay_record_t *drr);
 extern int
 stream_copy_records(FILE *infp, int outfd, zio_cksum_t *zc, int skip_begin);
 
+/*
+ * Validate that a stream file has a clean tail (no partial records at EOF).
+ * Reads all records, accumulates checksum into zc, but writes nothing.
+ * A "dirty" tail means EOF occurred mid-record-payload (file truncated
+ * within a WRITE/OBJECT/SPILL record), producing unrecoverable garbage.
+ *
+ * Returns: 1 if DRR_END was seen (stream complete),
+ *          0 on clean EOF at a record boundary (no DRR_END),
+ *          -1 on error,
+ *          -2 on dirty tail (EOF mid-record payload).
+ */
+extern int
+stream_validate_tail(FILE *infp, zio_cksum_t *zc);
+
 #ifdef __cplusplus
 }
 #endif
