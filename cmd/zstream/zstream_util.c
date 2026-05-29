@@ -303,6 +303,8 @@ stream_validate_tail(FILE *infp, zio_cksum_t *zc)
 		fletcher_4_incremental_native(&drr,
 		    offsetof(dmu_replay_record_t,
 		    drr_u.drr_checksum.drr_checksum), zc);
+		if (drr.drr_type != DRR_BEGIN)
+			drr.drr_u.drr_checksum.drr_checksum = *zc;
 		fletcher_4_incremental_native(
 		    &drr.drr_u.drr_checksum.drr_checksum,
 		    sizeof (zio_cksum_t), zc);
