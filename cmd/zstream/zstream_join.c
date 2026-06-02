@@ -246,7 +246,7 @@ zstream_do_join_merge(int argc, char *argv[])
 
 	fletcher_4_init();
 
-	/* Phase 1: validate head tail and accumulate checksum */
+	/* Phase 1: validate head and accumulate checksum */
 	FILE *headfp = fopen(headfile, "rb");
 	if (headfp == NULL) {
 		(void) fprintf(stderr,
@@ -255,10 +255,22 @@ zstream_do_join_merge(int argc, char *argv[])
 		return (1);
 	}
 
+	/* Ensure the head starts with DRR_BEGIN */
+	dmu_replay_record_t first_drr;
+	if (fread(&first_drr, sizeof (first_drr), 1, headfp) != 1 ||
+	    first_drr.drr_type != DRR_BEGIN) {
+		(void) fprintf(stderr,
+		    "Error: head %s does not start with DRR_BEGIN\n",
+		    headfile);
+		fclose(headfp);
+		return (1);
+	}
+
 	zio_cksum_t zc;
 	bzero(&zc, sizeof (zc));
 
-	int ret = stream_validate_tail(headfp, &zc);
+	/* O(1) tail validation: reads only the last record */
+	int ret = stream_validate_tail_fast(headfp, &zc);
 	fclose(headfp);
 
 	switch (ret) {

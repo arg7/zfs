@@ -86,6 +86,15 @@ stream_copy_records(FILE *infp, int outfd, zio_cksum_t *zc, int skip_begin);
 extern int
 stream_validate_tail(FILE *infp, zio_cksum_t *zc);
 
+/*
+ * O(1) variant: validates the tail by reading only the last record.
+ * Recovers the running checksum from the embedded per-record checksum
+ * via fletcher-4 inversion.  Same return values as stream_validate_tail().
+ * Does NOT verify DRR_BEGIN at the head — caller must do that if needed.
+ */
+extern int
+stream_validate_tail_fast(FILE *infp, zio_cksum_t *zc);
+
 #ifdef __cplusplus
 }
 #endif

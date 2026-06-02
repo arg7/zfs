@@ -315,3 +315,192 @@ stream_validate_tail(FILE *infp, zio_cksum_t *zc)
 		}
 	}
 }
+
+/*
+ * Undo a single fletcher-4 update: given output state Z and the word W
+ * that was added, recover the input state.  Process data words in LIFO
+ * order — the buffer's 32-bit words in reverse of the order
+ * fletcher_4_incremental_native traversed them.
+ */
+static void
+fletcher_4_decremental_native(const void *buf, uint64_t size, zio_cksum_t *zcp)
+{
+	const uint32_t *start = buf;
+	const uint32_t *ip = start + (size / sizeof (uint32_t));
+	uint64_t a = zcp->zc_word[0];
+	uint64_t b = zcp->zc_word[1];
+	uint64_t c = zcp->zc_word[2];
+	uint64_t d = zcp->zc_word[3];
+
+	while (ip > start) {
+		--ip;
+		d -= c;
+		c -= b;
+		b -= a;
+		a -= *ip;
+	}
+
+	zcp->zc_word[0] = a;
+	zcp->zc_word[1] = b;
+	zcp->zc_word[2] = c;
+	zcp->zc_word[3] = d;
+}
+
+/*
+ * O(1) tail validation: reads only the last record from a stream file
+ * that ends on a clean record boundary.  Recovers the running checksum
+ * from the embedded per-record checksum using fletcher-4 inversion,
+ * then forward-computes the final zc through that last record.
+ *
+ * Strategy:
+ *  1. Try S-sizeof(drr) first -- last record may be DRR_END (psize=0).
+ *  2. If not, read the trailing portion of the file into a buffer and
+ *     scan in 4-byte steps looking for a valid record header (drr_type
+ *     in [0, DRR_NUMTYPES) and file size alignment
+ *     S == pos + sizeof(drr) + psize).
+ *  3. If the trailing-buffer scan fails, fall back to the full O(n)
+ *     stream_validate_tail().
+ *
+ * The buffer size (2 MB) covers any realistic ZFS record size; records
+ * larger than that are handled by the fallback.
+ *
+ * Returns: 1 if DRR_END was seen (stream complete),
+ *          0 on clean tail (no DRR_END),
+ *          -1 on error,
+ *          -2 if the file appears to have a dirty tail (should not
+ *          happen for a clean-tail file, but checked defensively).
+ *
+ * Does NOT validate that the stream starts with DRR_BEGIN; the caller
+ * should do that separately if needed.
+ */
+
+#define	TRAILER_BUFSZ	(2ULL * 1024 * 1024)
+
+int
+stream_validate_tail_fast(FILE *infp, zio_cksum_t *zc)
+{
+	dmu_replay_record_t drr;
+	long S;
+
+	if (fseek(infp, 0, SEEK_END) != 0)
+		return (-1);
+	S = ftell(infp);
+	if (S < (long)sizeof (drr))
+		return (-1);
+
+	long pos = -1;
+	uint64_t psize = 0;
+
+	/*
+	 * Fast path #1: assume the last record has no payload (DRR_END,
+	 * or another type with a zero-size payload).
+	 */
+	if (fseek(infp, S - (long)sizeof (drr), SEEK_SET) == 0 &&
+	    fread(&drr, sizeof (drr), 1, infp) == 1 &&
+	    drr.drr_type >= DRR_BEGIN && drr.drr_type < DRR_NUMTYPES) {
+		uint64_t p = record_payload_size(&drr);
+		if (S - (long)sizeof (drr) + (long)sizeof (drr) +
+		    (long)p == S) {
+			pos = S - (long)sizeof (drr);
+			psize = p;
+		}
+	}
+
+	/*
+	 * Fast path #2: scan the trailing TRAILER_BUFSZ bytes in 4-byte
+	 * steps searching for a valid record header.
+	 */
+	if (pos < 0) {
+		uint64_t bufsz = TRAILER_BUFSZ;
+		if ((long)bufsz > S)
+			bufsz = (uint64_t)S;
+
+		unsigned char *buf = safe_malloc(bufsz);
+		if (fseek(infp, S - (long)bufsz, SEEK_SET) != 0 ||
+		    fread(buf, 1, bufsz, infp) != bufsz) {
+			free(buf);
+			return (-1);
+		}
+
+		for (long off = (long)bufsz - (long)sizeof (drr);
+		    off >= 0; off -= 4) {
+			uint32_t type;
+			memcpy(&type, buf + off, sizeof (type));
+
+			if (type >= DRR_NUMTYPES)
+				continue;
+
+			memcpy(&drr, buf + off, sizeof (drr));
+			uint64_t p = record_payload_size(&drr);
+
+			long filepos = S - (long)bufsz + off;
+			if (filepos + (long)sizeof (drr) +
+			    (long)p == S) {
+				pos = filepos;
+				psize = p;
+				break;
+			}
+		}
+		free(buf);
+	}
+
+	/* Fall back to full O(n) scan if fast paths didn't find it */
+	if (pos < 0) {
+		if (fseek(infp, 0, SEEK_SET) != 0)
+			return (-1);
+		return (stream_validate_tail(infp, zc));
+	}
+
+	/* Read the payload if any */
+	void *payload = NULL;
+	if (psize > 0) {
+		if (fseek(infp, pos + (long)sizeof (drr), SEEK_SET) != 0) {
+			return (-1);
+		}
+		payload = safe_malloc(psize);
+		if (fread(payload, psize, 1, infp) != 1) {
+			free(payload);
+			return (-2);
+		}
+	}
+
+	if (drr.drr_type == DRR_END) {
+		/*
+		 * Recover zc_before (stream checksum prior to DRR_END)
+		 * from the embedded record checksum.
+		 */
+		size_t hdrsize = offsetof(dmu_replay_record_t,
+		    drr_u.drr_checksum.drr_checksum);
+		*zc = drr.drr_u.drr_checksum.drr_checksum;
+		fletcher_4_decremental_native(&drr, hdrsize, zc);
+		free(payload);
+		return (1);
+	}
+
+	/*
+	 * The embedded checksum in a non-BEGIN record written by
+	 * dump_record() equals fletcher4(zc_before, header_part).
+	 * Undo the header-part contribution to recover zc_before,
+	 * then forward-compute the final zc the same way
+	 * dump_record() would.
+	 */
+	size_t hdrsize = offsetof(dmu_replay_record_t,
+	    drr_u.drr_checksum.drr_checksum);
+
+	*zc = drr.drr_u.drr_checksum.drr_checksum;
+	fletcher_4_decremental_native(&drr, hdrsize, zc);
+
+	fletcher_4_incremental_native(&drr, hdrsize, zc);
+	if (drr.drr_type != DRR_BEGIN)
+		drr.drr_u.drr_checksum.drr_checksum = *zc;
+	fletcher_4_incremental_native(
+	    &drr.drr_u.drr_checksum.drr_checksum,
+	    sizeof (zio_cksum_t), zc);
+
+	if (psize > 0) {
+		fletcher_4_incremental_native(payload, psize, zc);
+		free(payload);
+	}
+
+	return (0);
+}
